@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "run-shelf"
 version = "0.2.0"
-description = "Recover experiment metadata and evidence-backed lineage from messy ML directories."
+description = "Find experiments and trace their relationships."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -19,6 +19,3 @@ include = ["runshelf*"]
 
 [tool.setuptools.package-data]
 runshelf = ["viewer.html"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

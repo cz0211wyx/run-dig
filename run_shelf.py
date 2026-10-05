@@ -1,12 +1,12 @@
-"""Compatibility entry point for checkpoint listing and the archaeology CLI."""
+"""Support the original `python run_shelf.py DIRECTORY` command."""
 
 import sys
 
-from runshelf.cli import main
-from runshelf.legacy import format_size, main as list_checkpoints
+from runshelf.cli import format_size, main
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in {"scan", "list", "--version"}:
-        sys.exit(main())
-    sys.exit(list_checkpoints())
+    args = sys.argv[1:]
+    if not args or args[0] not in {"scan", "list", "--version"}:
+        args.insert(0, "list")
+    sys.exit(main(args))

@@ -9,11 +9,8 @@ import unittest
 from pathlib import Path
 
 from runshelf.cli import main
-from runshelf.extract import extract
-from runshelf.models import Artifact
-from runshelf.pipeline import analyze
+from runshelf.scan import analyze
 from runshelf.report import write_report
-from runshelf.scanner import inventory
 
 
 class PipelineTests(unittest.TestCase):
@@ -270,7 +267,7 @@ class PipelineTests(unittest.TestCase):
         def failing_walk(root, followlinks=False, onerror=None):
             onerror(PermissionError(13, 'permission denied', str(root / 'private')))
             return iter([])
-        with patch('runshelf.scanner.os.walk', failing_walk):
+        with patch('runshelf.scan.os.walk', failing_walk):
             report = self.report()
         self.assertTrue(report.statistics['partial'])
         self.assertEqual(report.warnings[0]['kind'], 'read_error')
