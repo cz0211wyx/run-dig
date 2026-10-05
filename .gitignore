@@ -3,3 +3,14 @@ __pycache__/
 
 # Local scan output
 /scan-results.txt
+
+# Local environments, editor preferences, and generated reports
+.venv/
+.vscode/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+/reports/
+/run-shelf-report/
+/demo-experiments/
