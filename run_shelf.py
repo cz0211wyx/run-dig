@@ -22,6 +22,11 @@ def format_size(size):
 def main():
     parser = argparse.ArgumentParser(description="Recursively find .pt, .pth, and .ckpt files.")
     parser.add_argument("directory", type=Path, help="Directory to scan")
+    parser.add_argument(
+        "--sort", choices=("name", "time", "size"), default="name",
+        help="Sort by name (A-Z, default), time (newest first), or size (largest first)",
+    )
+    parser.add_argument("--name", default="", help="Filter by filename substring (case-insensitive)")
     args = parser.parse_args()
     root = args.directory.expanduser().resolve()
     if not root.is_dir():
@@ -41,19 +46,30 @@ def main():
             path = Path(folder) / filename
             if path.suffix.lower() not in EXTENSIONS:
                 continue
+            if args.name.casefold() not in filename.casefold():
+                continue
             try:
                 info = path.stat()
             except OSError as error:
                 report_error(error)
                 continue
-            modified = datetime.fromtimestamp(info.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-            checkpoints.append((path, info.st_size, modified))
+            checkpoints.append((path, info.st_size, info.st_mtime))
 
+    sort_keys = {
+        "name": lambda item: (item[0].name.casefold(), str(item[0]).casefold()),
+        "time": lambda item: (-item[2], str(item[0]).casefold()),
+        "size": lambda item: (-item[1], str(item[0]).casefold()),
+    }
+    checkpoints.sort(key=sort_keys[args.sort])
     total_size = sum(size for _, size, _ in checkpoints)
     print(f"Found {len(checkpoints)} checkpoints, total size: {total_size / 1_000_000_000:.1f} GB")
-    print("\nPath\tSize\tLast modified")
+
+    name_width = max([len("name")] + [len(path.name) for path, _, _ in checkpoints])
+    size_width = max([len("size")] + [len(format_size(size)) for _, size, _ in checkpoints])
+    print(f"\n{'name':<{name_width}}  {'size':>{size_width}}  {'modified':<19}  path")
     for path, size, modified in checkpoints:
-        print(f"{path}\t{format_size(size)}\t{modified}")
+        modified = datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{path.name:<{name_width}}  {format_size(size):>{size_width}}  {modified}  {path}")
     if errors:
         print(f"Encountered {errors} read error(s); results may be incomplete.", file=sys.stderr)
     return 1 if errors else 0
