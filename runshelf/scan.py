@@ -125,7 +125,7 @@ ASSUMPTIONS = [
 
 
 def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=64_000_000,
-            hash_budget=512_000_000, max_files=100_000, similarity_threshold=.6, neighbors=3,
+            hash_budget=512_000_000, max_files=100_000, similarity_threshold=.6,
             max_pairs=200_000):
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
@@ -140,7 +140,7 @@ def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=
         warnings.extend({"kind": "extraction", "path": item.path, "message": warning} for warning in item.warnings)
     experiments, ownership = identify(artifacts)
     edges, inference_warnings = infer(experiments, artifacts, ownership, similarity_threshold=similarity_threshold,
-                                       neighbors=neighbors, max_pairs=max_pairs)
+                                       max_pairs=max_pairs)
     warnings.extend(inference_warnings)
     statistics.update({
         "artifacts": len(artifacts), "artifact_kinds": dict(Counter(item.kind for item in artifacts)),
@@ -156,7 +156,7 @@ def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=
     })
     options = {"excludes": sorted(DEFAULT_EXCLUDES) + list(excludes), "text_limit_bytes": text_limit,
                "checkpoint_hash_limit_bytes": hash_limit, "checkpoint_hash_budget_bytes": hash_budget,
-               "max_files": max_files, "similarity_threshold": similarity_threshold, "neighbors": neighbors,
+               "max_files": max_files, "similarity_threshold": similarity_threshold,
                "max_pairs": max_pairs}
     return Report("1.0", __version__, str(root), datetime.now(timezone.utc).isoformat(), options,
                   statistics, experiments, edges, artifacts, warnings, ASSUMPTIONS)

@@ -45,12 +45,19 @@ summary { cursor: pointer; }
 .relation-description { color: #687079; font-size: 12px; }
 .relationship details { margin: 6px 0 0; font-size: 12px; }
 .evidence { margin: 8px 0; padding-left: 18px; overflow-wrap: anywhere; }
-.kv td:first-child { width: 45%; color: #687079; }
+.kv { table-layout: fixed; }
+.kv th:first-child, .kv td:first-child { width: 28%; }
+.kv th:nth-child(2), .kv td:nth-child(2) { width: 27%; }
 .kv td { overflow-wrap: anywhere; }
-.graph-scroll { overflow-x: auto; margin-top: 14px; }
-.graph-scroll svg { width: 100%; min-width: 680px; display: block; }
+.view-switch, .graph-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.view-switch button, .graph-tools button { border: 1px solid #d2d7dd; border-radius: 4px; padding: 5px 12px; background: white; }
+.view-switch button[aria-pressed="true"] { background: #edf4fb; border-color: #3579bd; }
+.graph-viewport { overflow: auto; max-height: 620px; border: 1px solid #e5e7eb; background: #fafbfc; }
+.graph-viewport svg { display: block; }
 .graph-node { cursor: pointer; }
 .graph-node:focus rect { stroke: #245f9b; stroke-width: 2; }
+.graph-match rect { fill: #fff4cb; stroke: #ad7c08; }
+.origin { margin: 18px 0; }
 .notice { color: #87631d; }
 footer { border-top: 1px solid #e5e7eb; margin-top: 32px; padding-top: 12px; font-size: 12px; color: #687079; }
 footer a { color: #245f9b; }
@@ -76,18 +83,27 @@ footer a { color: #245f9b; }
   </header>
   <section id="overview">
     <h2>Experiments</h2>
-    <p class="muted">Choose an experiment to see its files and related experiments.</p>
+    <p class="muted">Choose an experiment to trace its sources and see its files.</p>
+    <nav class="view-switch" aria-label="Experiment view">
+      <button id="list-button" aria-pressed="true">List</button>
+      <button id="graph-button" aria-pressed="false">Full graph</button>
+    </nav>
     <div class="toolbar">
       <input id="search" type="search" placeholder="Search name or path" aria-label="Search experiments">
       <span id="list-count" class="muted"></span>
     </div>
-    <div class="table-wrap">
+    <div id="list-view" class="table-wrap">
       <table class="overview">
         <thead><tr><th>Name</th><th class="number">Checkpoints</th><th class="number">Size</th><th class="date">Modified</th></tr></thead>
         <tbody id="experiment-list"></tbody>
       </table>
     </div>
     <p id="empty" class="empty" hidden>No matching experiments.</p>
+    <div id="graph-view" hidden>
+      <label><input id="include-similar" type="checkbox"> Include similarity and identical files</label>
+      <p id="graph-count" class="muted"></p>
+      <div id="global-graph"></div>
+    </div>
   </section>
   <section id="detail" hidden>
     <button class="back" id="back">← All experiments</button>
@@ -106,6 +122,7 @@ const experiments = REPORT.experiments;
 const byId = new Map(experiments.map(item => [item.id, item]));
 const files = new Map(REPORT.artifacts.map(item => [item.id, item]));
 const links = new Map(experiments.map(item => [item.id, []]));
+let overviewView = 'list';
 for (const edge of REPORT.edges) {
   links.get(edge.source)?.push(edge);
   links.get(edge.target)?.push(edge);
@@ -143,7 +160,7 @@ function renderList() {
   const matching = experiments.filter(item => `${item.name} ${item.path}`.toLowerCase().includes(query));
   $('experiment-list').replaceChildren();
   $('list-count').textContent = `${matching.length} of ${experiments.length}`;
-  $('empty').hidden = matching.length > 0;
+  $('empty').hidden = matching.length > 0 || overviewView === 'graph';
   for (const item of matching) {
     const row = element('tr', undefined, 'experiment-row');
     const name = element('td', undefined, 'name');
@@ -156,6 +173,10 @@ function renderList() {
     row.append(name, element('td', String(item.checkpoint_count), 'number'),
       element('td', size(item.checkpoint_bytes), 'number'), element('td', modified(item.modified), 'date'));
     $('experiment-list').append(row);
+  }
+  const matches = new Set(matching.map(item => item.id));
+  for (const node of $('global-graph').querySelectorAll('.graph-node')) {
+    node.classList.toggle('graph-match', Boolean(query) && matches.has(node.dataset.id));
   }
 }
 
@@ -188,15 +209,23 @@ function fileTable(parent, members) {
 }
 
 function valueTable(parent, values, sources) {
+  const wrap = element('div', undefined, 'table-wrap');
   const table = element('table', undefined, 'kv');
+  const head = element('tr');
+  for (const title of ['Name', 'Value', 'Path']) head.append(element('th', title));
+  const thead = element('thead'); thead.append(head); table.append(thead);
+  const body = element('tbody');
   for (const [key, value] of Object.entries(values)) {
-    const row = element('tr'), name = element('td', key);
+    const row = element('tr'), path = element('td', undefined, 'path');
     const source = sources[key];
-    if (source) name.append(element('div', Array.isArray(source) ? source.map(item => item.artifact).join(', ') : source, 'path'));
-    row.append(name, element('td', typeof value === 'object' ? JSON.stringify(value) : String(value)));
-    table.append(row);
+    const prefix = typeof source === 'string' ? source.split('/').pop() + ':' : '';
+    const name = prefix && key.startsWith(prefix) ? key.slice(prefix.length) : key;
+    const paths = Array.isArray(source) ? [...new Set(source.map(item => item.artifact))] : source ? [source] : ['—'];
+    for (const file of paths) path.append(element('div', file));
+    row.append(element('td', name), element('td', typeof value === 'object' ? JSON.stringify(value) : String(value)), path);
+    body.append(row);
   }
-  parent.append(table);
+  table.append(body); wrap.append(table); parent.append(wrap);
 }
 
 function evidenceList(parent, edge) {
@@ -208,10 +237,48 @@ function evidenceList(parent, edge) {
     if (fact.value) line.append(element('div', String(fact.value), 'path'));
     if (fact.matched_fields?.length) line.append(element('div', `Matching fields: ${fact.matched_fields.join(', ')}`, 'path'));
     if (fact.artifacts?.length) line.append(element('div', fact.artifacts.join(', '), 'path'));
+    if (fact.matched_artifacts?.length) line.append(element('div', `Matched file: ${fact.matched_artifacts.join(', ')}`, 'path'));
     list.append(line);
   }
   for (const caveat of edge.caveats) list.append(element('li', caveat));
   parent.append(list);
+}
+
+function relationshipList(parent, edges, id) {
+  for (const edge of edges) {
+    const other = byId.get(edge.source === id ? edge.target : edge.source);
+    const row = element('div', undefined, 'relationship');
+    row.dataset.edgeId = edge.id;
+    row.append(element('div', `${describe(edge, id)} · ${Math.round(edge.confidence * 100)}% confidence`, 'relation-description'));
+    const button = element('button', other.path, 'related-link');
+    button.onclick = () => showExperiment(other.id);
+    row.append(button);
+    const fact = edge.evidence.find(item => item.artifact);
+    if (fact) row.append(element('div', `${fact.artifact}${fact.field ? ' · ' + fact.field : ''}`, 'path'));
+    const details = element('details'); details.append(element('summary', 'Why this link?'));
+    let rendered = false;
+    details.ontoggle = () => { if (details.open && !rendered) { rendered = true; evidenceList(details, edge); } };
+    row.append(details); parent.append(row);
+  }
+}
+
+function lineageFor(id) {
+  // Follow ancestors and descendants separately, without pulling in unrelated siblings.
+  const result = new Map();
+  for (const direction of ['source', 'target']) {
+    const pending = [id], seen = new Set();
+    while (pending.length) {
+      const current = pending.pop();
+      if (seen.has(current)) continue;
+      seen.add(current);
+      for (const edge of links.get(current)) {
+        if (!edge.directed || edge[direction] !== current) continue;
+        result.set(edge.id, edge);
+        pending.push(edge[direction === 'source' ? 'target' : 'source']);
+      }
+    }
+  }
+  return [...result.values()];
 }
 
 function showExperiment(id) {
@@ -224,25 +291,46 @@ function showExperiment(id) {
   heading.append(element('h2', item.name), element('div', item.path, 'path'),
     element('p', `${item.checkpoint_count} checkpoints · ${size(item.checkpoint_bytes)} · Modified ${modified(item.modified)}`, 'muted'));
   if (item.kind === 'checkpoint_candidate') heading.append(element('p', 'This checkpoint could not be linked to a specific run.', 'notice'));
-  panel.append(heading, element('h3', 'Checkpoints'));
+  panel.append(heading);
+  const related = [...links.get(id)].sort((a, b) => b.confidence - a.confidence);
+  const sources = related.filter(edge => edge.directed && edge.target === id);
+  const downstream = related.filter(edge => edge.directed && edge.source === id);
+  const origin = element('section', undefined, 'origin'); origin.id = 'origin';
+  origin.append(element('h3', 'Sources'));
+  if (!sources.some(edge => edge.kind === 'derived_from')) {
+    origin.append(element('p', sources.length ? 'No recorded continuation found. Checkpoint use and possible sources are listed below.' : 'Origin unknown: no source link found. Similarity alone cannot establish where this experiment came from.', 'muted'));
+  }
+  relationshipList(origin, sources, id);
+  for (const reference of item.references.filter(ref => ['unresolved', 'ambiguous'].includes(ref.resolution))) {
+    const row = element('div', undefined, 'relationship');
+    row.append(element('div', reference.resolution === 'ambiguous' ? 'Source ambiguous — multiple matches' : 'Source not found in this scan', 'notice'),
+      element('div', reference.value, 'path'), element('div', `${reference.artifact} · ${reference.field}`, 'path'));
+    for (const candidate of reference.candidates || []) {
+      const button = element('button', byId.get(candidate).path, 'related-link');
+      button.onclick = () => showExperiment(candidate);
+      const candidateRow = element('div'); candidateRow.append(button); row.append(candidateRow);
+    }
+    origin.append(row);
+  }
+  panel.append(origin);
+  const lineage = lineageFor(id);
+  if (lineage.length) {
+    panel.append(element('h3', 'Source chain'));
+    const graph = element('div'); graph.id = 'lineage-graph'; panel.append(graph);
+    const ids = new Set([id, ...lineage.flatMap(edge => [edge.source, edge.target])]);
+    renderGraph(graph, experiments.filter(exp => ids.has(exp.id)), lineage, id);
+  }
+  panel.append(element('h3', 'Used by'));
+  if (!downstream.length) panel.append(element('p', 'No downstream experiment found.', 'muted'));
+  relationshipList(panel, downstream, id);
+  const similar = related.filter(edge => !edge.directed);
+  if (similar.length) fold(panel, `Similar experiments and identical files (${similar.length})`, parent => {
+    parent.append(element('p', 'These links do not establish origin or copy direction.', 'muted'));
+    relationshipList(parent, similar, id);
+  });
+  panel.append(element('h3', 'Checkpoints'));
   const members = item.artifacts.map(key => files.get(key)).filter(Boolean);
   fileTable(panel, members.filter(file => file.kind === 'checkpoint'));
-  panel.append(element('h3', 'Related experiments'));
-  const related = [...links.get(id)].sort((a, b) => b.confidence - a.confidence);
-  if (!related.length) panel.append(element('p', 'No supported links found.', 'muted'));
-  for (const edge of related) {
-    const other = byId.get(edge.source === id ? edge.target : edge.source);
-    const row = element('div', undefined, 'relationship');
-    row.append(element('div', describe(edge, id), 'relation-description'));
-    const button = element('button', other.path, 'related-link');
-    button.onclick = () => showExperiment(other.id);
-    row.append(button);
-    const details = element('details'); details.append(element('summary', 'Why this link?'));
-    let rendered = false;
-    details.ontoggle = () => { if (details.open && !rendered) { rendered = true; evidenceList(details, edge); } };
-    row.append(details); panel.append(row);
-  }
-  if (related.length) fold(panel, 'Show relationship graph', parent => renderGraph(parent, item, related));
   if (Object.keys(item.config).length) fold(panel, `Configuration (${Object.keys(item.config).length})`, parent => valueTable(parent, item.config, item.config_sources));
   if (Object.keys(item.metrics).length) fold(panel, `Metrics (${Object.keys(item.metrics).length})`, parent => valueTable(parent, item.metrics, item.metric_sources));
   const otherFiles = members.filter(file => file.kind !== 'checkpoint');
@@ -256,51 +344,152 @@ function showExperiment(id) {
   $('back').focus({preventScroll: true});
 }
 
-function renderGraph(parent, selected, related) {
+function layoutGraph(nodes, edges) {
+  const adjacency = new Map(nodes.map(item => [item.id, []]));
+  for (const edge of edges) {
+    adjacency.get(edge.source).push(edge.target);
+    adjacency.get(edge.target).push(edge.source);
+  }
+  const components = [], seen = new Set();
+  for (const node of nodes) {
+    if (seen.has(node.id)) continue;
+    const ids = [], pending = [node.id]; seen.add(node.id);
+    while (pending.length) {
+      const id = pending.pop(); ids.push(id);
+      for (const next of adjacency.get(id)) {
+        if (!seen.has(next)) { seen.add(next); pending.push(next); }
+      }
+    }
+    components.push(ids);
+  }
+  components.sort((a, b) => b.length - a.length);
+  const boxes = components.map(ids => {
+    const members = new Set(ids), ranks = new Map(ids.map(id => [id, 0]));
+    const directed = edges.filter(edge => edge.directed && members.has(edge.source));
+    if (directed.length) {
+      const incoming = new Map(ids.map(id => [id, 0]));
+      const outgoing = new Map(ids.map(id => [id, []]));
+      for (const edge of directed) {
+        incoming.set(edge.target, incoming.get(edge.target) + 1);
+        outgoing.get(edge.source).push(edge.target);
+      }
+      const queue = ids.filter(id => incoming.get(id) === 0);
+      for (let i = 0; i < queue.length; i++) {
+        const id = queue[i];
+        for (const target of outgoing.get(id)) {
+          ranks.set(target, Math.max(ranks.get(target), ranks.get(id) + 1));
+          incoming.set(target, incoming.get(target) - 1);
+          if (!incoming.get(target)) queue.push(target);
+        }
+      }
+      // Cycles remain visible in the first column; never fabricate a time order.
+      for (const id of ids) if (incoming.get(id)) ranks.set(id, 0);
+    } else {
+      const queue = [ids[0]], visited = new Set(queue);
+      for (let i = 0; i < queue.length; i++) for (const next of adjacency.get(queue[i])) {
+        if (!visited.has(next)) { visited.add(next); ranks.set(next, ranks.get(queue[i]) + 1); queue.push(next); }
+      }
+    }
+    const rows = new Map(), points = new Map();
+    ids.sort((a, b) => byId.get(a).path.localeCompare(byId.get(b).path));
+    for (const id of ids) {
+      const rank = ranks.get(id), row = rows.get(rank) || 0;
+      points.set(id, {x: rank * 290, y: row * 84}); rows.set(rank, row + 1);
+    }
+    return {points, width: Math.max(...ranks.values()) * 290 + 220, height: Math.max(...rows.values()) * 84};
+  });
+  const width = Math.max(1060, ...boxes.map(box => box.width + 40));
+  const points = new Map(); let x = 20, y = 20, rowHeight = 0;
+  for (const box of boxes) {
+    if (x + box.width > width - 20) { x = 20; y += rowHeight + 36; rowHeight = 0; }
+    for (const [id, point] of box.points) points.set(id, {x: x + point.x, y: y + point.y});
+    x += box.width + 40; rowHeight = Math.max(rowHeight, box.height);
+  }
+  return {points, width, height: Math.max(100, y + rowHeight + 20)};
+}
+
+function renderGraph(parent, nodes, edges, selectedId = null) {
+  parent.replaceChildren();
+  if (!nodes.length) { parent.append(element('p', 'No experiments found.', 'muted')); return; }
   const ns = 'http://www.w3.org/2000/svg';
   const svgNode = (tag, attrs) => {
     const node = document.createElementNS(ns, tag);
     for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
     return node;
   };
-  const ids = [...new Set(related.map(edge => edge.source === selected.id ? edge.target : edge.source))];
-  const height = Math.max(180, ids.length * 95 + 30), center = height / 2;
-  const svg = svgNode('svg', {viewBox: `0 0 760 ${height}`, role: 'img', 'aria-label': 'Related experiments graph'});
-  const defs = svgNode('defs'), marker = svgNode('marker', {id: 'arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse'});
+  const {points, width, height} = layoutGraph(nodes, edges);
+  const svg = svgNode('svg', {viewBox: `0 0 ${width} ${height}`, role: 'group', 'aria-label': selectedId ? 'Experiment source chain' : 'All experiments graph'});
+  const arrowId = selectedId ? 'lineage-arrow' : 'global-arrow';
+  const defs = svgNode('defs'), marker = svgNode('marker', {id: arrowId, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto'});
   marker.append(svgNode('path', {d: 'M0,0 L10,5 L0,10 z', fill: '#758493'})); defs.append(marker); svg.append(defs);
   const labels = {derived_from: 'continues', references: 'checkpoint use', same_artifact: 'identical file', possible_derivation: 'possible continuation', similar_to: 'similar'};
-  related.forEach(edge => {
-    const otherId = edge.source === selected.id ? edge.target : edge.source;
-    const y = ids.indexOf(otherId) * 95 + 55;
-    const line = svgNode('path', {d: `M250,${center} C345,${center} 345,${y} 440,${y}`, fill: 'none', stroke: '#a0acb8', 'stroke-width': 1.5});
-    if (!edge.directed) line.setAttribute('stroke-dasharray', '4 4');
-    else line.setAttribute(edge.source === selected.id ? 'marker-end' : 'marker-start', 'url(#arrow)');
+  // Paint similarity first so recorded sources stay visible above it.
+  [...edges].sort((a, b) => Number(a.directed) - Number(b.directed)).forEach(edge => {
+    const a = points.get(edge.source), b = points.get(edge.target);
+    const forward = b.x > a.x, sameColumn = a.x === b.x;
+    const x1 = a.x + (forward || sameColumn ? 220 : 0), x2 = b.x + (forward ? 0 : 220);
+    const middle = sameColumn ? x1 + 35 : (x1 + x2) / 2;
+    const tentative = edge.kind === 'possible_derivation';
+    const line = svgNode('path', {d: `M${x1},${a.y + 28} C${middle},${a.y + 28} ${middle},${b.y + 28} ${x2},${b.y + 28}`, fill: 'none', stroke: tentative ? '#af7a28' : edge.directed ? '#527c9d' : '#c5cdd4', 'stroke-width': edge.directed ? 1.8 : 1, class: 'graph-edge', 'data-id': edge.id});
+    if (tentative) line.setAttribute('stroke-dasharray', '5 4');
+    if (edge.directed) line.setAttribute('marker-end', `url(#${arrowId})`);
     const title = svgNode('title'); title.textContent = `${labels[edge.kind]} · ${Math.round(edge.confidence * 100)}% confidence`;
     line.append(title); svg.append(line);
   });
-  function card(item, x, y, current) {
-    const group = svgNode('g', {transform: `translate(${x} ${y - 30})`, class: 'graph-node', tabindex: 0, role: 'button', 'aria-label': item.path});
-    group.append(svgNode('rect', {width: current ? 230 : 295, height: 60, rx: 5, fill: current ? '#f0f5fa' : 'white', stroke: '#c8d1da'}));
+  for (const item of nodes) {
+    const {x, y} = points.get(item.id), current = item.id === selectedId;
+    const group = svgNode('g', {transform: `translate(${x} ${y})`, class: 'graph-node', 'data-id': item.id, tabindex: 0, role: 'button', 'aria-label': item.path});
+    group.append(svgNode('rect', {width: 220, height: 56, rx: 5, fill: current ? '#e8f2fc' : 'white', stroke: current ? '#3579bd' : '#c8d1da'}));
     const title = svgNode('title'); title.textContent = item.path; group.append(title);
     const name = svgNode('text', {x: 12, y: 24, fill: '#24292f', 'font-size': 12});
     name.textContent = item.name.length > 28 ? item.name.slice(0, 26) + '…' : item.name;
     const hint = svgNode('text', {x: 12, y: 44, fill: '#687079', 'font-size': 10});
-    hint.textContent = current ? 'Selected experiment' : item.path.length > 44 ? '…' + item.path.slice(-42) : item.path;
+    hint.textContent = item.path.length > 32 ? '…' + item.path.slice(-30) : item.path;
     group.append(name, hint);
     group.onclick = () => showExperiment(item.id);
-    group.onkeydown = event => { if (event.key === 'Enter') showExperiment(item.id); };
+    group.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showExperiment(item.id); } };
     svg.append(group);
   }
-  card(selected, 20, center, true);
-  ids.forEach((id, index) => card(byId.get(id), 440, index * 95 + 55, false));
-  const wrap = element('div', undefined, 'graph-scroll'); wrap.append(svg); parent.append(wrap);
-  parent.append(element('p', 'Arrows show recorded use or possible continuation. Dotted lines show similarity or identical files.', 'path'));
+  const toolbar = element('div', undefined, 'graph-tools'), zoom = element('span', '100%', 'path');
+  const wrap = element('div', undefined, 'graph-viewport'); wrap.tabIndex = 0; wrap.setAttribute('aria-label', 'Scrollable graph');
+  let scale = 1;
+  function resize(value) {
+    scale = Math.max(.05, Math.min(2, value));
+    svg.style.width = `${width * scale}px`; svg.style.height = `${height * scale}px`;
+    zoom.textContent = `${Math.round(scale * 100)}%`;
+  }
+  for (const [label, action] of [['−', () => resize(scale / 1.25)], ['+', () => resize(scale * 1.25)], ['Fit', () => resize(Math.min(wrap.clientWidth / width, 600 / height, 1))], ['100%', () => resize(1)]]) {
+    const button = element('button', label); button.onclick = action; toolbar.append(button);
+  }
+  toolbar.append(zoom); parent.append(toolbar);
+  wrap.append(svg); parent.append(wrap); resize(1);
+  parent.append(element('p', 'Arrows: source → experiment using it. Dashed arrows: possible continuation. Gray lines: similarity or identical files. Scroll to explore; click a node for evidence.', 'path'));
+}
+
+function showOverview(view) {
+  overviewView = view;
+  $('list-view').hidden = view !== 'list'; $('graph-view').hidden = view !== 'graph';
+  $('list-button').setAttribute('aria-pressed', String(view === 'list'));
+  $('graph-button').setAttribute('aria-pressed', String(view === 'graph'));
+  if (view === 'graph' && !$('global-graph').children.length) renderOverviewGraph();
+  renderList();
+}
+
+function renderOverviewGraph() {
+  const edges = REPORT.edges.filter(edge => edge.directed || $('include-similar').checked);
+  const sourceCount = edges.filter(edge => edge.directed).length;
+  $('graph-count').textContent = `${experiments.length} experiments · ${sourceCount} source links${edges.length > sourceCount ? ` · ${edges.length - sourceCount} similarity / identical-file links` : ''}. Experiments without links are shown separately.`;
+  renderGraph($('global-graph'), experiments, edges);
+  renderList();
 }
 
 $('scan-summary').textContent = `${REPORT.statistics.checkpoints} checkpoints · ${size(REPORT.statistics.checkpoint_bytes)}`;
 $('root').textContent = REPORT.root;
 $('partial').hidden = !REPORT.statistics.partial;
 $('search').oninput = renderList;
+$('list-button').onclick = () => showOverview('list');
+$('graph-button').onclick = () => showOverview('graph');
+$('include-similar').onchange = renderOverviewGraph;
 $('download').onclick = event => {
   event.preventDefault();
   const url = URL.createObjectURL(new Blob([JSON.stringify(REPORT, null, 2)], {type: 'application/json'}));
@@ -310,7 +499,7 @@ $('download').onclick = event => {
 $('back').onclick = () => {
   $('detail').hidden = true; $('overview').hidden = false;
   $('experiment-detail').replaceChildren();
-  $('search').focus({preventScroll: true}); window.scrollTo(0, 0);
+  $(overviewView === 'graph' ? 'graph-button' : 'search').focus({preventScroll: true}); window.scrollTo(0, 0);
 };
 const noteCount = REPORT.warnings.length;
 $('notes-label').textContent = noteCount ? `Scan notes (${noteCount})` : 'Scan notes';

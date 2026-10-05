@@ -145,6 +145,26 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(any(e.kind == "similar_to" for e in report.edges))
         self.assertTrue(all(not e.directed for e in report.edges))
 
+    def test_all_supported_similarities_are_retained(self):
+        for name in ['a', 'b', 'c', 'd', 'e', 'f']:
+            self.run_folder(name)
+        report = self.report()
+        similar = [edge for edge in report.edges if edge.kind == 'similar_to']
+        self.assertEqual(len(similar), 15)
+        first = report.experiments[0].id
+        self.assertEqual(sum(first in (edge.source, edge.target) for edge in similar), 5)
+        self.assertTrue(all(not edge.directed for edge in similar))
+
+    def test_multi_generation_sources_are_retained(self):
+        self.run_folder('base')
+        self.run_folder('middle', resume_from='../base/best.pt')
+        self.run_folder('leaf', resume_from='../middle/best.pt')
+        self.run_folder('sibling', resume_from='../base/best.pt')
+        report = self.report()
+        names = {node.id: node.path for node in report.experiments}
+        sources = {(names[edge.source], names[edge.target]) for edge in report.edges if edge.kind == 'derived_from'}
+        self.assertEqual(sources, {('base', 'middle'), ('middle', 'leaf'), ('base', 'sibling')})
+
     def test_strong_similarity_and_recorded_time_is_only_tentative(self):
         options = {"dropout": .1, "layers": 2, "hidden_size": 32, "optimizer": "adam"}
         self.run_folder("one", **options)

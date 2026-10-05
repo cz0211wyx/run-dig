@@ -44,7 +44,7 @@ def name_tokens(name):
     return tokens - {"final", "new", "folder", "best", "last", "run", "runs", "pt", "pth", "ckpt", "s", "seed", "v", "copy", "checkpoint"}
 
 
-def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, neighbors=3, max_pairs=200_000):
+def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pairs=200_000):
     edges, warnings = {}, []
     exp_index = {item.id: item for item in experiments}
     file_index = {item.path: item for item in artifacts}
@@ -157,7 +157,6 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, neighbo
     if capped:
         warnings.append({"kind": "limit", "path": ".", "message": f"Similarity candidate budget ({max_pairs}) reached. Explicit references remain complete; some similarities were not compared."})
 
-    candidates = []
     explicit_pairs = {frozenset((item.source, item.target)) for item in edges.values() if item.directed}
     for left_id, right_id in sorted(pairs):
         left, right = exp_index[left_id], exp_index[right_id]
@@ -193,16 +192,8 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, neighbo
                 {"signal": "explicit run chronology", "source_finished": earlier.finished, "target_started": later.started,
                  "time_sources": earlier.time_sources + later.time_sources}],
                 caveats=["Chronology and shared configuration/code suggest an alternative, not proven ancestry; runs may be independent."], changes=changes)
-        candidates.append(item)
-
-    # Keep top-k alternatives per node to make the graph browsable; ties are deterministic.
-    counts = defaultdict(int)
-    for item in sorted(candidates, key=lambda item: (-item.confidence, item.id)):
-        if counts[item.source] >= neighbors or counts[item.target] >= neighbors:
-            continue
+        # Keep every supported relationship. Presentation must not prune evidence.
         add(item)
-        counts[item.source] += 1
-        counts[item.target] += 1
 
     adjacency = defaultdict(set)
     for item in edges.values():

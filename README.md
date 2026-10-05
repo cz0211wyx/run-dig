@@ -9,8 +9,8 @@ python -m pip install -e .
 run-shelf scan ./experiments --open
 ```
 
-The report opens as an experiment list. Click an experiment to see its files,
-configuration, metrics, and related experiments. Uncertain links are labeled.
+Switch between the experiment list and the full graph. Click an experiment to see
+its sources, downstream experiments, and files. Similarity alone is not ancestry.
 Results are saved to `run-shelf-report/index.html` and `report.json`.
 
 To list checkpoints in the terminal:
