@@ -236,6 +236,182 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(main(['inspect', str(self.root / 'absent.pt')]), 2)
             self.assertEqual(main(['inspect', str(checkpoint), '--root', str(self.root / 'other')]), 2)
 
+    def checkpoint_records(self, report, path):
+        return next(item for item in report.artifacts if item.path == path).metadata.get('metric_records', [])
+
+    def test_explicit_metric_rows_bind_arbitrary_checkpoint_names(self):
+        self.run_folder('run')
+        self.put('run/final_final2.pt', b'a')
+        self.put('run/new name.ckpt', b'b')
+        self.put('run/metrics.csv', 'checkpoint,epoch,accuracy\nfinal_final2.pt,3,0.9\nnew name.ckpt,4,0.8\n')
+        report = self.report()
+        first = self.checkpoint_records(report, 'run/final_final2.pt')
+        second = self.checkpoint_records(report, 'run/new name.ckpt')
+        self.assertEqual(first[0]['values'], {'epoch': 3., 'accuracy': .9})
+        self.assertEqual(second[0]['values']['epoch'], 4)
+        self.assertEqual(first[0]['source'], 'run/metrics.csv:2')
+        self.assertGreater(first[0]['confidence'], .9)
+        self.assertFalse(self.checkpoint_records(report, 'run/best.pt'))
+        self.assertNotIn('_metric_rows', json.dumps(report.to_dict()))
+
+    def test_best_checkpoint_gets_selected_epoch_not_last_epoch(self):
+        self.run_folder('run')
+        self.put('run/last.pt', b'last')
+        self.put('run/result.json', {'best_epoch': 1, 'best_loss': 2, 'initial_loss': 3})
+        report = self.report()
+        best = self.checkpoint_records(report, 'run/best.pt')
+        last = self.checkpoint_records(report, 'run/last.pt')
+        self.assertTrue(all(record['values']['epoch'] == 1 for record in best))
+        self.assertEqual(last[0]['values'], {'epoch': 2, 'loss': 1})
+        self.assertTrue(all(record['confidence'] < .8 for record in best + last))
+        self.assertNotIn('initial_loss', best[0]['values'])
+        self.assertEqual(report.experiments[0].metrics['history.jsonl:epoch'], 2)
+
+    def test_sidecar_metrics_do_not_become_last_checkpoint_history(self):
+        self.run_folder('run')
+        self.put('run/initial.pt', b'initial')
+        self.put('run/last.pt', b'last')
+        self.put('run/initial.json', {'epoch': 0, 'accuracy': .1})
+        report = self.report()
+        initial = self.checkpoint_records(report, 'run/initial.pt')
+        last = self.checkpoint_records(report, 'run/last.pt')
+        self.assertEqual(initial[0]['values']['epoch'], 0)
+        self.assertEqual(len(last), 1)
+        self.assertEqual(last[0]['values']['epoch'], 2)
+
+    def test_best_epoch_conflicts_and_duplicate_rows_are_not_guessed(self):
+        self.run_folder('run')
+        self.put('run/result.json', {'best_epoch': 1})
+        self.put('run/summary.json', {'best_epoch': 2})
+        self.assertFalse(self.checkpoint_records(self.report(), 'run/best.pt'))
+        self.put('run/summary.json', {'best_epoch': 1})
+        self.put('run/history.jsonl', '{"epoch":1,"loss":2}\n{"epoch":1,"loss":1}\n')
+        records = self.checkpoint_records(self.report(), 'run/best.pt')
+        self.assertTrue(records)
+        self.assertTrue(all('history' not in record['source'] for record in records))
+
+    def test_multiple_best_checkpoints_are_ambiguous(self):
+        self.run_folder('run')
+        self.put('run/best.ckpt', b'other best')
+        self.put('run/result.json', {'best_epoch': 1})
+        report = self.report()
+        self.assertFalse(self.checkpoint_records(report, 'run/best.pt'))
+        self.assertFalse(self.checkpoint_records(report, 'run/best.ckpt'))
+
+    def test_last_checkpoint_rejects_partial_malformed_and_restarted_history(self):
+        self.run_folder('run')
+        self.put('run/last.pt', b'last')
+        for history in ('{"epoch":1,"loss":2}\nbroken\n', '{"epoch":2,"loss":1}\n{"epoch":1,"loss":2}\n'):
+            self.put('run/history.jsonl', history)
+            self.assertFalse(self.checkpoint_records(self.report(), 'run/last.pt'))
+        self.put('run/history.jsonl', '{"epoch":1,"loss":2}\n' * 100)
+        self.assertFalse(self.checkpoint_records(self.report(text_limit=300), 'run/last.pt'))
+
+    def test_metric_record_limit_does_not_imply_final_epoch(self):
+        from runshelf.metadata import extract, checkpoint_metrics
+        from runshelf.models import Artifact
+        self.put('history.jsonl', '{"epoch":1,"loss":2}\n{"epoch":2,"loss":1}\n{"epoch":3,"loss":0}\n')
+        history = Artifact('history', 'history.jsonl', 'metrics', 0, 0)
+        checkpoint = Artifact('cp', 'last.pt', 'checkpoint', 0, 0)
+        extract(self.root, history, record_limit=2)
+        checkpoint_metrics([history, checkpoint])
+        self.assertFalse(checkpoint.metadata.get('metric_records'))
+        self.assertTrue(history.warnings)
+
+    def test_epoch_filename_needs_a_unique_matching_record(self):
+        self.run_folder('run')
+        self.put('run/epoch=1.ckpt', b'one')
+        self.put('run/final_final2.pt', b'two')
+        report = self.report()
+        self.assertEqual(self.checkpoint_records(report, 'run/epoch=1.ckpt')[0]['values']['epoch'], 1)
+        self.assertFalse(self.checkpoint_records(report, 'run/final_final2.pt'))
+
+    def test_json_metric_records_keep_checkpoint_scopes_separate(self):
+        self.run_folder('run')
+        self.put('run/other.pt', b'other')
+        self.put('run/metrics.json', {'evaluations': [
+            {'checkpoint': 'best.pt', 'metrics': {'accuracy': .9}},
+            {'checkpoint': 'other.pt', 'metrics': {'accuracy': .2}}]})
+        report = self.report()
+        self.assertEqual(self.checkpoint_records(report, 'run/best.pt')[0]['values'], {'accuracy': .9})
+        self.assertEqual(self.checkpoint_records(report, 'run/other.pt')[0]['values'], {'accuracy': .2})
+
+    def test_input_checkpoint_and_unresolved_output_are_not_metric_targets(self):
+        self.run_folder('run')
+        self.put('run/other.pt', b'other')
+        self.put('run/metrics.json', {'source_checkpoint': 'other.pt', 'accuracy': .9})
+        self.put('run/best.json', {'checkpoint': 'missing.pt', 'accuracy': .8})
+        report = self.report()
+        self.assertFalse(self.checkpoint_records(report, 'run/other.pt'))
+        self.assertFalse(self.checkpoint_records(report, 'run/best.pt'))
+
+    def test_nested_evaluation_cannot_leak_into_sidecar_parent(self):
+        self.run_folder('run')
+        self.put('run/other.pt', b'other')
+        self.put('run/best.json', {'evaluation': {'fold1': {'checkpoint': 'other.pt', 'accuracy': .3}}})
+        report = self.report()
+        self.assertFalse(self.checkpoint_records(report, 'run/best.pt'))
+        self.assertEqual(self.checkpoint_records(report, 'run/other.pt')[0]['values'], {'accuracy': .3})
+
+    def test_loose_checkpoint_can_have_metrics_without_an_invented_run(self):
+        self.put('new folder/final_final2.pt', b'unknown model')
+        self.put('new folder/final_final2.json', {'accuracy': .8})
+        report = self.report()
+        self.assertEqual(report.experiments[0].kind, 'checkpoint_candidate')
+        self.assertEqual(self.checkpoint_records(report, 'new folder/final_final2.pt')[0]['values'], {'accuracy': .8})
+
+    def test_per_sample_predictions_are_not_checkpoint_summary_metrics(self):
+        self.run_folder('run')
+        self.put('run/best.csv', 'sample,score\n1,0.9\n2,0.1\n')
+        self.assertFalse(self.checkpoint_records(self.report(), 'run/best.pt'))
+
+    def test_compare_shows_seed_changes_and_checkpoint_metrics_without_writes(self):
+        self.run_folder('a', seed=42)
+        self.run_folder('b', seed=123)
+        self.put('a/metrics.json', {'checkpoint': 'best.pt', 'accuracy': .9})
+        self.put('b/metrics.json', {'checkpoint': 'best.pt', 'accuracy': .8})
+        before = sorted(self.root.rglob('*'))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(['compare', 'a/best.pt', 'b/best.pt', '--root', str(self.root)]), 0)
+        for text in ('train.seed', '42', '123', 'accuracy', '0.9', '0.8', 'a/metrics.json', 'b/metrics.json', 'similar to'):
+            self.assertIn(text, output.getvalue())
+        self.assertEqual(before, sorted(self.root.rglob('*')))
+        self.assertNotIn('train.lr', output.getvalue())
+
+    def test_compare_does_not_substitute_run_metrics_for_unknown_checkpoint(self):
+        self.run_folder('a')
+        self.run_folder('b')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(['compare', str(self.root / 'a/best.pt'), str(self.root / 'b/best.pt')]), 0)
+        self.assertIn('Unknown; run-level metrics are not substituted.', output.getvalue())
+        self.assertNotIn('loss', output.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(['compare', 'a/best.pt', 'missing.pt', '--root', str(self.root)]), 2)
+
+    def test_compare_preserves_conflicting_metric_records(self):
+        self.run_folder('a')
+        self.run_folder('b')
+        self.put('a/metrics.json', {'checkpoint': 'best.pt', 'accuracy': .9})
+        self.put('a/evaluation.json', {'checkpoint': 'best.pt', 'accuracy': .7})
+        self.put('b/metrics.json', {'checkpoint': 'best.pt', 'accuracy': .8})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(['compare', 'a/best.pt', 'b/best.pt', '--root', str(self.root), '--full']), 0)
+        self.assertIn('Conflicting records; see sources.', output.getvalue())
+
+    def test_inspect_distinguishes_checkpoint_metrics_from_run_summary(self):
+        self.run_folder('run')
+        self.put('run/result.json', {'best_epoch': 1})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(['inspect', 'run/best.pt', '--root', str(self.root)]), 0)
+        checkpoint_text = output.getvalue().split('Checkpoint metrics:')[1].split('Run configuration:')[0]
+        self.assertIn('epoch: 1', checkpoint_text)
+        self.assertNotIn('epoch: 2', checkpoint_text)
+        self.assertIn('not necessarily this checkpoint', output.getvalue())
+
     def test_reference_is_not_automatically_derivation(self):
         self.run_folder("base")
         self.run_folder("evaluator", references=[{"checkpoint": "../base/best.pt"}])
@@ -291,6 +467,134 @@ class PipelineTests(unittest.TestCase):
         first = report.experiments[0].id
         self.assertEqual(sum(first in (edge.source, edge.target) for edge in similar), 5)
         self.assertTrue(all(not edge.directed for edge in similar))
+
+    def test_parent_collection_counts_children_without_duplicating_checkpoints(self):
+        self.put('batch/config.json', {'lr': .01, 'epochs': 10, 'batch_size': 16})
+        self.put('batch/summary.json', {'epoch': 2, 'loss': .2})
+        self.run_folder('batch/a')
+        self.run_folder('batch/b')
+        report = self.report()
+        nodes = {node.path: node for node in report.experiments}
+        parent = nodes['batch']
+        self.assertEqual(parent.kind, 'collection')
+        self.assertEqual(parent.checkpoint_count, 0)
+        self.assertEqual(parent.subtree_checkpoint_count, 2)
+        self.assertEqual(set(parent.children), {nodes['batch/a'].id, nodes['batch/b'].id})
+        self.assertEqual(nodes['batch/a'].parent_id, parent.id)
+        self.assertEqual(sum(node.checkpoint_count for node in report.experiments), report.statistics['checkpoints'])
+        self.assertFalse(any(parent.id in (edge.source, edge.target) and edge.kind == 'similar_to' for edge in report.edges))
+        self.assertEqual(report.statistics['collections'], 1)
+
+    def test_nested_collections_have_nearest_parent_and_recursive_totals(self):
+        for folder in ('batch', 'batch/nested'):
+            self.put(folder + '/config.json', {'lr': .01, 'epochs': 10})
+            self.put(folder + '/summary.json', {'loss': .2})
+        self.run_folder('batch/nested/run')
+        self.run_folder('batch/direct')
+        self.run_folder('batch-other')
+        nodes = {node.path: node for node in self.report().experiments}
+        self.assertEqual(nodes['batch'].subtree_checkpoint_count, 2)
+        self.assertEqual(nodes['batch/nested'].subtree_checkpoint_count, 1)
+        self.assertEqual(nodes['batch/nested/run'].parent_id, nodes['batch/nested'].id)
+        self.assertEqual(nodes['batch/nested'].parent_id, nodes['batch'].id)
+        self.assertIsNone(nodes['batch-other'].parent_id)
+
+    def test_checkpoint_storage_folder_is_not_an_experiment_collection(self):
+        self.put('run/config.json', {'lr': .1, 'batch_size': 8})
+        self.put('run/checkpoints/best.pt', b'best')
+        self.put('run/checkpoints/last.pt', b'last')
+        report = self.report()
+        self.assertEqual(len(report.experiments), 1)
+        self.assertEqual(report.experiments[0].kind, 'experiment')
+        self.assertEqual(report.experiments[0].checkpoint_count, 2)
+
+    def component_batch(self, name, roles=True, seed=42):
+        self.put(name + '/config.json', {'lr': .01, 'batch_size': 16, 'epochs': 10, 'model': 'tiny', 'seed': seed})
+        self.put(name + '/summary.json', {'loss': .2, 'phase': 'parent'})
+        for child, role in [('odd name', 'audio'), ('another folder', 'vision')]:
+            self.put(name + '/' + child + '/best.pt', (name + child).encode())
+            self.put(name + '/' + child + '/history.jsonl', '{"epoch":1,"loss":0.3}\n')
+            if roles:
+                self.put(name + '/' + child + '/state.json', {'phase': role})
+
+    def test_recorded_roles_distinguish_components_with_shared_parent_config(self):
+        self.component_batch('batch')
+        report = self.report()
+        nodes = {node.path: node for node in report.experiments}
+        pair = {nodes['batch/odd name'].id, nodes['batch/another folder'].id}
+        relation = next(edge for edge in report.edges if {edge.source, edge.target} == pair)
+        self.assertEqual(relation.kind, 'similar_to')
+        self.assertIn('Different recorded roles', relation.description)
+        self.assertLessEqual(relation.confidence, .55)
+        self.assertIn('role.phase', relation.changes)
+        self.assertEqual(nodes['batch/odd name'].roles['phase'], 'audio')
+        self.assertTrue(any(fact.get('artifact', '').endswith('state.json') for fact in relation.evidence))
+
+    def test_shared_configuration_alone_has_low_confidence_and_unknown_roles(self):
+        self.component_batch('batch', roles=False)
+        report = self.report()
+        relations = [edge for edge in report.edges if edge.kind == 'similar_to']
+        self.assertEqual(len(relations), 1)
+        self.assertIn('run similarity unverified', relations[0].description)
+        self.assertLessEqual(relations[0].confidence, .5)
+        children = [node for node in report.experiments if node.parent_id]
+        self.assertTrue(all(not node.roles for node in children))
+
+    def test_cross_batch_components_are_compared_by_recorded_role(self):
+        self.component_batch('batch-a', seed=42)
+        self.component_batch('batch-b', seed=3407)
+        report = self.report()
+        nodes = {node.path: node for node in report.experiments}
+        same_role = {nodes['batch-a/odd name'].id, nodes['batch-b/odd name'].id}
+        different_roles = {nodes['batch-a/odd name'].id, nodes['batch-b/another folder'].id}
+        relation = next(edge for edge in report.edges if {edge.source, edge.target} == same_role)
+        self.assertIn('except seed', relation.description)
+        self.assertEqual(set(relation.changes['seed'].values()), {42, 3407})
+        self.assertLessEqual(relation.confidence, .65)
+        self.assertFalse(any({edge.source, edge.target} == different_roles for edge in report.edges))
+
+    def test_similarity_explains_training_and_model_configuration_changes(self):
+        self.run_folder('base', seed=42, hidden_size=32)
+        self.run_folder('lr-change', seed=42, hidden_size=32, lr=.002)
+        self.run_folder('model-change', seed=42, hidden_size=64)
+        for name in ('base', 'lr-change', 'model-change'):
+            self.put(name + '/source/train.py', '# same training snapshot\n')
+        report = self.report()
+        nodes = {node.path: node for node in report.experiments}
+        for name, label, field in [('lr-change', 'Training settings differ', 'train.lr'), ('model-change', 'Model configuration differs', 'train.hidden_size')]:
+            pair = {nodes['base'].id, nodes[name].id}
+            relation = next(edge for edge in report.edges if {edge.source, edge.target} == pair)
+            self.assertIn(label, relation.description)
+            self.assertIn(field, relation.changes)
+            self.assertFalse(relation.directed)
+
+    def test_conflicting_roles_do_not_produce_seed_variant_claim(self):
+        self.run_folder('one', seed=1)
+        self.run_folder('two', seed=2)
+        self.put('one/state.json', {'phase': 'audio'})
+        self.put('one/summary.json', {'phase': 'vision'})
+        self.put('two/state.json', {'phase': 'audio'})
+        report = self.report()
+        relation = next(edge for edge in report.edges if edge.kind == 'similar_to')
+        self.assertIn('conflicting role declarations', relation.description)
+        self.assertLessEqual(relation.confidence, .5)
+
+    def test_seed_change_with_changed_code_is_not_described_as_seed_only(self):
+        self.run_folder('one', seed=1)
+        self.run_folder('two', seed=2)
+        self.put('one/source/train.py', 'MODEL = "first"')
+        self.put('two/source/train.py', 'MODEL = "different"')
+        relation = next(edge for edge in self.report().edges if edge.kind == 'similar_to')
+        self.assertIn('code snapshots also differ', relation.description)
+        self.assertNotIn('except seed', relation.description)
+
+    def test_compare_prints_specific_relationship_description(self):
+        self.run_folder('one', seed=1)
+        self.run_folder('two', seed=2)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(['compare', 'one/best.pt', 'two/best.pt', '--root', str(self.root)]), 0)
+        self.assertIn('Recorded settings match except seed', output.getvalue())
 
     def test_multi_generation_sources_are_retained(self):
         self.run_folder('base')

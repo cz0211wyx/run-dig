@@ -103,7 +103,7 @@ const assert = require('node:assert/strict');
       await page.locator('#list-button').click();
       assert.equal(await page.locator('.experiment-link').count(), initial);
     }
-    const unknown = report.experiments.find(item => !report.edges.some(edge => edge.directed && edge.target === item.id));
+    const unknown = report.experiments.find(item => item.kind !== 'collection' && !report.edges.some(edge => edge.directed && edge.target === item.id));
     if (unknown) {
       await page.locator(`button[data-id="${unknown.id}"]`).click();
       assert((await page.locator('#origin').innerText()).includes('Origin unknown'));
@@ -115,6 +115,57 @@ const assert = require('node:assert/strict');
     if (unresolved) {
       await page.locator(`button[data-id="${unresolved.id}"]`).click();
       assert((await page.locator('#origin').innerText()).includes('Source not found in this scan'));
+      await page.locator('#back').click();
+    }
+    const checkpoint = report.artifacts.find(item => item.kind === 'checkpoint' && item.metadata?.metric_records?.length);
+    if (checkpoint) {
+      const owner = report.experiments.find(item => item.artifacts.includes(checkpoint.id));
+      await page.locator(`button[data-id="${owner.id}"]`).click();
+      const details = page.locator(`[data-checkpoint="${checkpoint.id}"]`);
+      await details.locator('summary').click();
+      await details.locator('table').first().waitFor();
+      assert.equal(await details.locator('table').count(), checkpoint.metadata.metric_records.length);
+      for (const [index, record] of checkpoint.metadata.metric_records.entries()) {
+        const table = details.locator('table').nth(index);
+        assert.deepEqual(await table.locator('th').allTextContents(), ['Name', 'Value', 'Path']);
+        assert.equal(await table.locator('tbody tr').count(), Object.keys(record.values).length);
+        assert((await table.innerText()).includes(record.source));
+        assert((await details.innerText()).includes(record.basis));
+      }
+      await page.setViewportSize({ width: 390, height: 844 });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+      await page.setViewportSize({ width: 1440, height: 960 });
+      await page.locator('#back').click();
+    }
+    const collection = report.experiments.find(item => item.kind === 'collection' && item.children.length);
+    if (collection) {
+      const row = page.locator('.experiment-row').filter({has: page.locator(`button[data-id="${collection.id}"]`)});
+      assert((await row.innerText()).includes(`${collection.subtree_checkpoint_count} total`));
+      await row.locator('button').click();
+      assert((await page.locator('.detail-header').innerText()).includes(`${collection.subtree_checkpoint_count} checkpoints total`));
+      assert.equal(await page.locator('#collection-members [data-child]').count(), collection.children.length);
+      assert(!(await page.locator('#experiment-detail').innerText()).includes('No checkpoint files found.'));
+      await page.screenshot({path: process.argv[3].replace(/\.png$/, '-collection.png')});
+      await page.locator('#collection-members [data-child]').first().click();
+      await page.locator(`[data-collection="${collection.id}"]`).click();
+      assert.equal(await page.locator('#experiment-detail h2').innerText(), collection.name);
+      await page.setViewportSize({ width: 390, height: 844 });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+      await page.screenshot({path: process.argv[3].replace(/\.png$/, '-collection-mobile.png')});
+      await page.setViewportSize({ width: 1440, height: 960 });
+      await page.locator('#back').click();
+    }
+    const explained = report.edges.find(edge => edge.kind === 'similar_to' && edge.description && Object.keys(edge.changes).length);
+    if (explained) {
+      await page.locator(`button[data-id="${explained.source}"]`).click();
+      await page.locator('#experiment-detail details').filter({has: page.locator('summary', {hasText: /^Similar experiments/})}).locator('summary').click();
+      const relation = page.locator(`[data-edge-id="${explained.id}"]`);
+      assert((await relation.innerText()).includes(explained.description));
+      await relation.locator('summary').click();
+      await relation.locator('table').waitFor();
+      assert.deepEqual(await relation.locator('th').allTextContents(), ['Name', 'First', 'Second']);
+      const rows = await relation.locator('tbody tr').evaluateAll(nodes => nodes.map(node => [...node.cells].map(cell => cell.innerText)));
+      assert.deepEqual(rows, Object.entries(explained.changes).map(([key, change]) => [key, String(change.source ?? '(not recorded)'), String(change.target ?? '(not recorded)')]));
       await page.locator('#back').click();
     }
     await page.locator('#notes-label').click();

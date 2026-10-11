@@ -29,6 +29,12 @@ class Experiment:
     confidence: float
     evidence: list[str]
     kind: str = "experiment"
+    parent_id: str | None = None
+    children: list[str] = field(default_factory=list)
+    subtree_checkpoint_count: int = 0
+    subtree_checkpoint_bytes: int = 0
+    roles: dict[str, str] = field(default_factory=dict)
+    role_sources: dict[str, list[dict]] = field(default_factory=dict)
     artifacts: list[str] = field(default_factory=list)
     config: dict[str, Any] = field(default_factory=dict)
     config_sources: dict[str, list[dict]] = field(default_factory=dict)
@@ -57,6 +63,7 @@ class Edge:
     evidence: list[dict]
     caveats: list[str] = field(default_factory=list)
     changes: dict[str, Any] = field(default_factory=dict)
+    description: str = ""
 
 
 @dataclass

@@ -22,11 +22,15 @@ def normalized(value):
 
 def comparable_config(experiment):
     result = {}
+    if experiment.kind == "collection":
+        return result
     for key, value in experiment.config.items():
         lower = key.lower()
         if any(word in lower for word in ("sha256", "hash", "checkpoint", "references", "source", "output", "device", "gpu", "version", "time", "seed", "samples", "counts", "weights")):
             continue
         if isinstance(value, (str, int, float, bool)) and value != "[REDACTED]" and not str(value).startswith("[omitted"):
+            if any(source["value"] != value for source in experiment.config_sources.get(key, [])):
+                continue
             result[key] = value
     return result
 
@@ -34,8 +38,85 @@ def comparable_config(experiment):
 def training_seed(experiment):
     for key in ("train.seed", "training.seed", "seed", "config.seed"):
         if key in experiment.config:
-            return experiment.config[key]
+            value = experiment.config[key]
+            return value if not any(source["value"] != value for source in experiment.config_sources.get(key, [])) else None
     return None
+
+
+def local_field(experiment, key):
+    return any(not source.get("inherited") for source in experiment.config_sources.get(key, []))
+
+
+def inherited_configs(experiment):
+    return {source["artifact"] for sources in experiment.config_sources.values() for source in sources if source.get("inherited")}
+
+
+def local_scripts(experiment):
+    inherited = inherited_configs(experiment)
+    return {digest for digest, sources in experiment.script_sources.items()
+            if any(source.split("#", 1)[0] not in inherited for source in sources)}
+
+
+def similarity_details(left, right, changes, matched, shared_scripts, score):
+    """Describe observed differences; borrowed configuration is weaker evidence."""
+    roles = set(left.roles) & set(right.roles)
+    ambiguous_roles = (set(left.role_sources) - set(left.roles)) | (set(right.role_sources) - set(right.roles))
+    role_changes = {key: {"source": left.roles[key], "target": right.roles[key]}
+                    for key in sorted(roles) if left.roles[key] != right.roles[key]}
+    shared_parent = inherited_configs(left) & inherited_configs(right)
+    same_collection = left.parent_id is not None and left.parent_id == right.parent_id
+    local_matches = [key for key in matched if local_field(left, key) and local_field(right, key)]
+    shared_local_scripts = set(shared_scripts) & local_scripts(left) & local_scripts(right)
+    independent = len(local_matches) >= 3 or bool(shared_local_scripts) or bool(roles and not role_changes)
+    if role_changes and not (same_collection or shared_parent):
+        return None  # Different components across batches are not model variants.
+    if not independent and not shared_parent:
+        return None
+    confidence = min(score, .85)
+    caveats = []
+    if len(local_matches) < len(matched) / 2:
+        confidence = min(confidence, .65)
+        caveats.append("Most matching settings come from inferred parent configuration; component applicability is not verified.")
+    if role_changes:
+        description = "Different recorded roles in the same collection" if same_collection else "Different recorded roles sharing parent configuration"
+        confidence = min(confidence, .55)
+    elif ambiguous_roles:
+        description = "Shared configuration; conflicting role declarations"
+        confidence = min(confidence, .5)
+        caveats.append("Conflicting role declarations prevent identifying a component or seed variant.")
+    elif not independent:
+        description = "Shared parent configuration; run similarity unverified"
+        confidence = min(confidence, .5)
+    else:
+        seed_a, seed_b = training_seed(left), training_seed(right)
+        seed_changed = seed_a is not None and seed_b is not None and seed_a != seed_b
+        if not changes and seed_changed:
+            if local_scripts(left) and local_scripts(right) and local_scripts(left) != local_scripts(right):
+                description = f"Recorded seed differs ({seed_a} vs {seed_b}); code snapshots also differ"
+            else:
+                description = f"Recorded settings match except seed ({seed_a} vs {seed_b})"
+        elif changes:
+            structural = [key for key in changes if re.search(r"(^|[._])(architecture|model|model_type|module|layers|num_layers|hidden_dim|hidden_size|head_dim)([._]|$)", key, re.I)]
+            dataset = [key for key in changes if re.search(r"(^|[._])(dataset|data|split)([._]|$)", key, re.I)]
+            keys = structural or dataset or list(changes)
+            category = "Model configuration differs" if structural else "Dataset configuration differs" if dataset else "Training settings differ"
+            description = category + ": " + ", ".join(keys[:3]) + (f" (+{len(keys) - 3} more)" if len(keys) > 3 else "")
+            if seed_changed:
+                description += f"; seed {seed_a} vs {seed_b}"
+        else:
+            description = "Matching recorded configuration" + (" and code" if shared_local_scripts else "")
+        if seed_changed:
+            changes["seed"] = {"source": seed_a, "target": seed_b}
+    for key, value in role_changes.items():
+        changes["role." + key] = value
+    facts = [{"signal": "run-local configuration support", "matched_fields": local_matches,
+              "inherited_match_count": len(matched) - len(local_matches)}]
+    for side, experiment in (("source", left), ("target", right)):
+        for role in sorted(experiment.role_sources):
+            facts.extend({"signal": f"recorded {side} role", **source} for source in experiment.role_sources.get(role, []))
+    if shared_parent:
+        facts.append({"signal": "shared parent configuration", "artifacts": sorted(shared_parent)})
+    return description, confidence, caveats, facts, bool(role_changes or ambiguous_roles), len(local_matches)
 
 
 def name_tokens(name):
@@ -179,6 +260,8 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
     # Candidate blocks require actual matching config values or source hashes, never a name alone.
     blocks = defaultdict(list)
     for exp in experiments:
+        if exp.kind == "collection":
+            continue
         for key, value in configs[exp.id].items():
             blocks[("config", key, str(value))].append(exp.id)
         for digest in exp.script_hashes:
@@ -213,19 +296,26 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
         if len(matched) < 3 or score < similarity_threshold:
             continue
         changes = {key: {"source": a.get(key), "target": b.get(key)} for key in sorted(set(a) | set(b)) if a.get(key) != b.get(key)}
+        config_changed = bool(changes)
+        details = similarity_details(left, right, changes, matched, shared_scripts, score)
+        if details is None:
+            continue
+        description, confidence, caveats, facts, role_conflict, local_matches = details
         evidence = [{"signal": "configuration agreement", "matched_fields": matched, "score": round(config_score, 3),
                      "sources": {key: [left.config_sources.get(key, []), right.config_sources.get(key, [])] for key in matched}},
                     {"signal": "source hash overlap", "shared_hashes": shared_scripts, "score": round(script_score, 3)},
                     {"signal": "weak name token overlap", "tokens": sorted(names_a & names_b), "score": round(name_score, 3)}]
-        item = edge(left_id, right_id, "similar_to", min(score, .85), evidence, directed=False,
-                    caveats=["Similarity is not ancestry. Scores are heuristic, not calibrated probabilities."], changes=changes)
+        evidence.extend(facts)
+        item = edge(left_id, right_id, "similar_to", confidence, evidence, directed=False,
+                    caveats=["Similarity is not ancestry. Scores are heuristic, not calibrated probabilities.", *caveats], changes=changes)
+        item.description = description
         # Mtimes never orient an edge. Only strong multi-signal similarity plus explicit run times can suggest chronology.
         earlier, later = (left, right)
         if right.finished is not None and left.started is not None and right.finished <= left.started:
             earlier, later = right, left
         seeds = training_seed(earlier), training_seed(later)
         seed_conflict = all(value is not None for value in seeds) and seeds[0] != seeds[1]
-        if score >= .8 and shared_scripts and changes and not seed_conflict and earlier.finished is not None and later.started is not None and earlier.finished <= later.started:
+        if score >= .8 and shared_scripts and config_changed and local_matches >= 3 and not role_conflict and not seed_conflict and earlier.finished is not None and later.started is not None and earlier.finished <= later.started:
             changes = {key: {"source": configs[earlier.id].get(key), "target": configs[later.id].get(key)} for key in sorted(set(a) | set(b)) if a.get(key) != b.get(key)}
             item = edge(earlier.id, later.id, "possible_derivation", min(score, .75), evidence + [
                 {"signal": "explicit run chronology", "source_finished": earlier.finished, "target_started": later.started,

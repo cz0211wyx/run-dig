@@ -1,4 +1,4 @@
-"""Scan experiments, list checkpoints, or inspect one checkpoint."""
+"""Scan experiments, list checkpoints, and inspect or compare their metadata."""
 
 import argparse
 import json
@@ -68,27 +68,66 @@ def list_checkpoints(args):
     return 1 if errors else 0
 
 
-def inspect_checkpoint(args):
-    checkpoint = args.checkpoint.expanduser()
-    root = args.root.expanduser().resolve() if args.root else None
-    checkpoint = ((root / checkpoint) if root and not checkpoint.is_absolute() else checkpoint).resolve()
-    if not checkpoint.is_file() or checkpoint.suffix.lower() not in CHECKPOINT_EXTENSIONS:
-        raise ValueError(f"Not a checkpoint file: {checkpoint}")
+def load_checkpoints(paths, root=None):
+    root = root.expanduser().resolve() if root else None
+    checkpoints = []
+    for path in paths:
+        path = path.expanduser()
+        path = ((root / path) if root and not path.is_absolute() else path).resolve()
+        if not path.is_file() or path.suffix.lower() not in CHECKPOINT_EXTENSIONS:
+            raise ValueError(f"Not a checkpoint file: {path}")
+        checkpoints.append(path)
     if root is None:
-        root = checkpoint.parent.parent if checkpoint.parent.name in ARTIFACT_FOLDERS else checkpoint.parent
-    if not checkpoint.is_relative_to(root):
-        raise ValueError("Checkpoint must be inside --root.")
+        parents = [path.parent.parent if path.parent.name in ARTIFACT_FOLDERS else path.parent for path in checkpoints]
+        root = Path(os.path.commonpath(parents))
+        if root == Path(root.anchor):
+            raise ValueError("Please set --root to an experiment directory instead of scanning an entire drive.")
+    if any(not checkpoint.is_relative_to(root) for checkpoint in checkpoints):
+        raise ValueError("Checkpoints must be inside --root.")
     print(f"Scanning {root} ...", flush=True)
     report = analyze(root)
-    relative = checkpoint.relative_to(root).as_posix()
-    artifact = next((item for item in report.artifacts if item.path == relative), None)
-    if artifact is None:
-        raise ValueError("Checkpoint was excluded or unreadable; it was not analyzed.")
-    experiment = next(item for item in report.experiments if artifact.id in item.artifacts)
+    artifacts = {item.path: item for item in report.artifacts if item.kind == "checkpoint"}
+    owners = {key: item for item in report.experiments for key in item.artifacts}
+    result = []
+    for checkpoint in checkpoints:
+        artifact = artifacts.get(checkpoint.relative_to(root).as_posix())
+        if artifact is None:
+            raise ValueError("Checkpoint was excluded or unreadable; it was not analyzed.")
+        result.append((checkpoint, artifact, owners[artifact.id]))
+    return report, result
+
+
+def display_value(value, limit=200):
+    value = f"{value:.6g}" if isinstance(value, float) else json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+    return value[:limit] + ("..." if len(value) > limit else "")
+
+
+def print_checkpoint_metrics(artifact, full=False):
+    print("\nCheckpoint metrics:")
+    records = artifact.metadata.get("metric_records", [])
+    if not records:
+        print("  Unknown: no supported metric record for this file.")
+    for record in records:
+        print(f"  {record['source']} (confidence {record['confidence']:.0%})")
+        print(f"    {record['basis']}")
+        keys = sorted(record["values"], key=lambda key: (key != "epoch", "score" not in key, key))
+        for key in keys if full else keys[:8]:
+            print(f"    {key}: {display_value(record['values'][key])}")
+        if not full and len(keys) > 8:
+            print(f"    ... {len(keys) - 8} more fields; use --full to show all.")
+
+
+def inspect_checkpoint(args):
+    report, [(checkpoint, artifact, experiment)] = load_checkpoints([args.checkpoint], args.root)
     print(f"\nCheckpoint: {checkpoint}\nSize: {format_size(artifact.size)}")
     print(f"Modified: {datetime.fromtimestamp(artifact.modified):%Y-%m-%d %H:%M:%S}")
     print(f"Experiment: {experiment.path}")
-    print(f"Scan root: {root}")
+    if experiment.parent_id:
+        parent = next(item for item in report.experiments if item.id == experiment.parent_id)
+        print(f"Collection: {parent.path} ({parent.subtree_checkpoint_count} checkpoints in sub-experiments)")
+    if experiment.roles:
+        print("Role: " + ", ".join(f"{key}={value}" for key, value in experiment.roles.items()))
+    print(f"Scan root: {report.root}")
     if args.root is None:
         print("Use --root DIRECTORY to include sources and experiments outside this folder.")
     if experiment.kind == "checkpoint_candidate":
@@ -112,20 +151,95 @@ def inspect_checkpoint(args):
     for reference in experiment.references:
         if reference.get("resolution") in {"unresolved", "ambiguous"}:
             print(f"  {reference['resolution'].capitalize()} source: {reference['value']}")
-    # These are run-level facts, not values read from the model's serialized state.
+    print_checkpoint_metrics(artifact, args.full)
+    # Run summaries remain useful context, but must not be mistaken for this file.
     for heading, values in (("Run configuration", experiment.config), ("Run metrics", experiment.metrics)):
         print(f"\n{heading}:")
+        if heading == "Run metrics":
+            print("  Run summaries / last parsed log values; not necessarily this checkpoint.")
         visible = {key: value for key, value in values.items() if not any(word in key.lower() for word in ("sha256", "hash"))}
         if not visible:
             print("  Not found.")
         core = {"model", "model_type", "architecture", "seed", "lr", "learning_rate", "batch_size", "epochs"}
         keys = sorted(visible, key=lambda key: (not (key.rsplit('.', 1)[-1] in core if heading == "Run configuration" else 'best_' in key), key))
         for key in keys if args.full else keys[:8]:
-            value = visible[key]
-            value = f"{value:.6g}" if isinstance(value, float) else json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-            print(f"  {key}: {value[:200]}" + ("..." if len(value) > 200 else ""))
+            print(f"  {key}: {display_value(visible[key])}")
         if not args.full and len(keys) > 8:
             print(f"  ... {len(keys) - 8} more fields; use --full to show all.")
+    if report.statistics["warnings"]:
+        print(f"\n{report.statistics['warnings']} reading/inference notes; some metadata may be unavailable.")
+    return 1 if report.statistics["partial"] else 0
+
+
+def compare_checkpoints(args):
+    report, entries = load_checkpoints([args.first, args.second], args.root)
+    for label, (path, artifact, experiment) in zip("AB", entries):
+        print(f"{label}: {path} ({format_size(artifact.size)})")
+        print(f"   Experiment: {experiment.path}")
+    left, right = entries[0][2], entries[1][2]
+    print("\nRun relationship:")
+    relations = [edge for edge in report.edges if {edge.source, edge.target} == {left.id, right.id}]
+    if left.id == right.id:
+        print("  Same experiment; file-to-file ancestry is unknown.")
+    elif not relations:
+        print("  No supported relationship in this scan.")
+    for edge in relations:
+        direction = ("A -> B" if edge.source == left.id else "B -> A") if edge.directed else "A -- B"
+        print(f"  {direction}: {edge.kind.replace('_', ' ')} (confidence {edge.confidence:.0%})")
+        if edge.description:
+            print(f"    {edge.description}")
+        for caveat in edge.caveats:
+            print(f"    {caveat}")
+
+    def config(experiment):
+        result = {}
+        for key, value in experiment.config.items():
+            if value == "[REDACTED]" or any(word in key.lower() for word in ("sha256", "hash")):
+                continue
+            alternatives = experiment.config_sources.get(key, [])
+            if any(source["value"] != value for source in alternatives):
+                value = {"conflicting_values": [source["value"] for source in alternatives]}
+            elif any(source.get("inherited") for source in alternatives):
+                value = f"{display_value(value)} (inferred parent config)"
+            result[key] = value
+        return result
+
+    def table(title, a, b, differences=False):
+        print(f"\n{title}:")
+        keys = sorted(set(a) | set(b), key=lambda key: (key != "epoch", "score" not in key, key))
+        if differences:
+            keys = [key for key in keys if key not in a or key not in b or a[key] != b[key]]
+        if not keys:
+            print("  No differences in recovered fields." if differences and (a or b) else "  No comparable metadata found.")
+            return
+        rows = [(key, display_value(a[key]) if key in a else "(not recorded)", display_value(b[key]) if key in b else "(not recorded)")
+                for key in (keys if args.full else keys[:20])]
+        # Keep ordinary terminals readable; --full retains every field/value.
+        if not args.full:
+            rows = [tuple(display_value(cell, 52 if index else 48) for index, cell in enumerate(row)) for row in rows]
+        widths = [max(len(row[index]) for row in [("Name", "A", "B"), *rows]) for index in range(3)]
+        for row in [("Name", "A", "B"), *rows]:
+            print("  " + " | ".join(cell.ljust(width) for cell, width in zip(row, widths)))
+        if not args.full and len(keys) > 20:
+            print(f"  ... {len(keys) - 20} more fields; use --full to show all.")
+
+    table("Configuration differences", config(left), config(right), differences=True)
+    recovered = []
+    for label, (_, artifact, _) in zip("AB", entries):
+        records = artifact.metadata.get("metric_records", [])
+        values = {}
+        print(f"\n{label} metric sources:")
+        if not records:
+            print("  Unknown; run-level metrics are not substituted.")
+        for record in records:
+            print(f"  {record['source']} ({record['confidence']:.0%}) - {record['basis']}")
+            for key, value in record["values"].items():
+                if key in values and values[key] != value:
+                    values[key] = "Conflicting records; see sources."
+                else:
+                    values[key] = value
+        recovered.append(values)
+    table("Checkpoint metrics (same field names; check evaluation settings)", *recovered)
     if report.statistics["warnings"]:
         print(f"\n{report.statistics['warnings']} reading/inference notes; some metadata may be unavailable.")
     return 1 if report.statistics["partial"] else 0
@@ -148,10 +262,15 @@ def main(argv=None):
     inspect.add_argument("checkpoint", type=Path, help="Checkpoint file; relative to --root when provided")
     inspect.add_argument("--root", type=Path, help="Scan this directory for related experiments (default: checkpoint's folder)")
     inspect.add_argument("--full", action="store_true", help="Show all configuration and metric fields")
+    compare = commands.add_parser("compare", help="Compare two checkpoints' recovered configuration and metrics")
+    compare.add_argument("first", type=Path)
+    compare.add_argument("second", type=Path)
+    compare.add_argument("--root", type=Path, help="Scan directory; checkpoint paths are relative to it (default: common parent)")
+    compare.add_argument("--full", action="store_true", help="Show every field and longer values")
     args = parser.parse_args(argv)
-    if args.command == "inspect":
+    if args.command in {"inspect", "compare"}:
         try:
-            return inspect_checkpoint(args)
+            return inspect_checkpoint(args) if args.command == "inspect" else compare_checkpoints(args)
         except (OSError, ValueError) as error:
             print(f"Error: {error}", file=sys.stderr)
             return 2
@@ -170,7 +289,9 @@ def main(argv=None):
         print(f"Error: {error}", file=sys.stderr)
         return 2
     stats = report.statistics
-    print(f"Found {stats['checkpoints']} checkpoints in {stats['experiments']} experiment candidates.")
+    collections = stats['collections']
+    print(f"Found {stats['checkpoints']} checkpoints in {stats['experiments'] - collections} experiment candidates" +
+          (f" and {collections} collections." if collections else "."))
     print(f"Report: {html}")
     if stats["warnings"]:
         print(f"{stats['warnings']} reading notes in the report.")

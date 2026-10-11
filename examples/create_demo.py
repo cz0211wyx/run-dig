@@ -28,7 +28,7 @@ def create_demo(root):
     write("new folder/source/train.py", "# Static snapshot; never executed.\nMODEL = 'small-transformer'\n")
     write("retry after lunch/config.json", {**config, "lr": .0003, "resume_from": "../new folder/checkpoints/final_final2.pt"})
     write("retry after lunch/best.ckpt", b"synthetic checkpoint B; not a real model")
-    write("retry after lunch/metrics.csv", "epoch,loss,accuracy\n1,0.7,0.68\n2,0.4,0.75\n")
+    write("retry after lunch/metrics.csv", "epoch,loss,accuracy,checkpoint\n1,0.7,0.68,\n2,0.4,0.75,best.ckpt\n")
     write("retry after lunch/state.json", {"started_at_utc": "2026-01-02T10:00:00Z"})
     write("different seed/config.json", {**config, "seed": 123})
     write("different seed/last.pth", b"synthetic independent run C")

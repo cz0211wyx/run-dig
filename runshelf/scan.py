@@ -145,6 +145,7 @@ def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=
     statistics.update({
         "artifacts": len(artifacts), "artifact_kinds": dict(Counter(item.kind for item in artifacts)),
         "experiments": len(experiments), "anchored_experiments": sum(item.kind == "experiment" for item in experiments),
+        "collections": sum(item.kind == "collection" for item in experiments),
         "checkpoint_candidates": sum(item.kind == "checkpoint_candidate" for item in experiments),
         "checkpoints": sum(item.kind == "checkpoint" for item in artifacts),
         "checkpoint_bytes": sum(item.size for item in artifacts if item.kind == "checkpoint"),

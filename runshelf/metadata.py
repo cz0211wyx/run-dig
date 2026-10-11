@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import math
+import posixpath
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ METRIC = re.compile(r"(^|[._])(loss|accuracy|acc|f1|macro_f1|weighted_f1|mae|mse
 CHECKPOINT = re.compile(r"\.(pt|pth|ckpt|safetensors)$", re.I)
 HASH = re.compile(r"^[0-9a-f]{64}$", re.I)
 TRAIN_KEYS = {"seed", "lr", "learning_rate", "epochs", "batch_size", "optimizer", "model_type", "model", "architecture", "dataset", "dropout", "hidden_size"}
+METRIC_TARGET_KEYS = {"checkpoint", "checkpoint_path", "output_checkpoint", "saved_checkpoint", "model_path"}
 
 
 def scalar(value):
@@ -278,11 +280,37 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
         except UnicodeDecodeError:
             text = raw.decode("utf-8-sig", errors="replace")
             artifact.warnings.append("Non-UTF-8 bytes replaced while reading text.")
-        fields, records = {}, 0
+        fields, records, metric_rows = {}, 0, []
+
+        def remember(value, location, depth=0, record=True):
+            # Retain individual rows until checkpoint attribution; never merge epochs.
+            if depth > 12 or len(metric_rows) >= record_limit:
+                return
+            if isinstance(value, dict):
+                markers = METRIC_TARGET_KEYS | {"epoch", "best_epoch"}
+                separate = {key for key, child in value.items() if isinstance(child, list) or
+                            isinstance(child, dict) and markers.intersection(child)}
+                row = flatten({key: child for key, child in value.items() if key not in separate}) if record else {}
+                nested_targets = [key.rsplit(".", 1)[0] + "." for key in row
+                                  if "." in key and key.rsplit(".", 1)[-1] in METRIC_TARGET_KEYS]
+                row = {key: child for key, child in row.items() if not any(key.startswith(prefix) for prefix in nested_targets)}
+                relevant = markers.intersection(row) or (suffix == ".json" and location == artifact.path)
+                if relevant and any(METRIC.search(key) and isinstance(v, (int, float)) for key, v in row.items()):
+                    metric_rows.append({"fields": row, "source": location})
+                for key, child in value.items():
+                    if not SECRET.search(str(key)) and isinstance(child, (dict, list)):
+                        # Each nested evaluation keeps its own checkpoint scope.
+                        remember(child, f"{location}#{key}", depth + 1, record=key in separate)
+            elif isinstance(value, list):
+                for index, child in enumerate(value[:record_limit]):
+                    remember(child, f"{location}[{index}]", depth + 1)
+
         if artifact.kind == "script":
             fields = script_fields(text, suffix)
         elif suffix == ".json":
-            fields = flatten(json.loads(text))
+            value = json.loads(text)
+            fields = flatten(value)
+            remember(value, artifact.path)
         elif suffix in {".yaml", ".yml"}:
             try:
                 import yaml
@@ -304,11 +332,13 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
         elif suffix in {".jsonl", ".csv", ".tsv"}:
             if suffix == ".jsonl":
                 rows = text.splitlines()
-                for line in rows[:record_limit]:
+                for number, line in enumerate(rows[:record_limit], 1):
                     if not line.strip():
                         continue
                     try:
-                        fields.update(flatten(json.loads(line)))
+                        value = json.loads(line)
+                        fields.update(flatten(value))
+                        remember(value, f"{artifact.path}:{number}")
                         records += 1
                     except (ValueError, RecursionError):
                         artifact.warnings.append("Malformed JSONL record skipped.")
@@ -324,6 +354,7 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
                         except (ValueError, TypeError):
                             pass
                     records += 1
+                    remember(fields, f"{artifact.path}:{reader.line_num}")
             if records >= record_limit:
                 artifact.warnings.append(f"Record limit ({record_limit}) reached; metrics reflect the last parsed record, not necessarily the final epoch.")
             fields = flatten(fields)
@@ -342,6 +373,11 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
         if artifact.kind == "metadata" and suffix == ".json" and len(leaves & {"lr", "learning_rate", "batch_size", "optimizer", "dropout"}) >= 2:
             artifact.kind = "config"
         artifact.metadata["records_read"] = records
+        if metric_rows and artifact.kind != "config":
+            if len(metric_rows) >= record_limit:
+                artifact.warnings.append(f"Metric record limit ({record_limit}) reached; checkpoint attribution may be incomplete.")
+            artifact.metadata["_metric_rows"] = metric_rows
+            artifact.metadata["_history_complete"] = not truncated and not artifact.warnings and records < record_limit
         # Warnings should not grow with every corrupt line.
         artifact.warnings = list(dict.fromkeys(artifact.warnings))
     except Exception as error:
@@ -351,6 +387,102 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
 
 ARTIFACT_FOLDERS = {"checkpoints", "checkpoint", "weights", "ckpts", "models"}
 SUPPORT_FOLDERS = ARTIFACT_FOLDERS | {"logs", "source", "src", "scripts", "configs", ".hydra"}
+
+
+def checkpoint_metrics(members):
+    """Attribute recorded metrics without opening model files or guessing from mtime."""
+    checkpoints = [item for item in members if item.kind == "checkpoint"]
+    records = [(item, row) for item in members for row in item.metadata.get("_metric_rows", [])]
+    target_keys = METRIC_TARGET_KEYS
+
+    def values(fields, best=False):
+        result = {}
+        for key, value in fields.items():
+            if "[" in key or not METRIC.search(key) or not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if best:
+                if key.startswith("best_"):
+                    result[key[5:]] = value
+            elif key != "epochs":
+                result[key.removeprefix("metrics.")] = value
+        return result
+
+    def add(checkpoint, row, selected, confidence, basis):
+        if selected:
+            checkpoint.metadata.setdefault("metric_records", []).append({
+                "values": selected, "source": row["source"], "confidence": confidence, "basis": basis,
+            })
+
+    for item, row in records:
+        fields = row["fields"]
+        declared = [value for key, value in fields.items() if key in target_keys and isinstance(value, str) and CHECKPOINT.search(value)]
+        if declared:
+            paths = set()
+            for value in declared:
+                value = value.replace("\\", "/")
+                paths.update((posixpath.normpath(value), posixpath.normpath(str(PurePosixPath(item.path).parent / value))))
+            matches = [cp for cp in checkpoints if cp.path in paths]
+            if len(declared) == 1 and len(matches) == 1:
+                add(matches[0], row, values(fields, best="best_epoch" in fields and "epoch" not in fields), .95, "Checkpoint path recorded with metrics")
+            continue
+        # A matching sidecar is useful evidence, but still a naming convention.
+        source = PurePosixPath(item.path)
+        if source.suffix.lower() != ".json" or row["source"] != item.path:
+            continue  # Prediction rows and nested evaluations are not file summaries.
+        matches = [cp for cp in checkpoints if source.parent == PurePosixPath(cp.path).parent and
+                   source.stem in {PurePosixPath(cp.path).stem, PurePosixPath(cp.path).stem + ".metrics", PurePosixPath(cp.path).name}]
+        if len(matches) == 1:
+            add(matches[0], row, values(fields, best="best_epoch" in fields and "epoch" not in fields), .8, "Matching metadata filename; model contents not verified")
+
+    best_epochs = {row["fields"]["best_epoch"] for _, row in records
+                   if isinstance(row["fields"].get("best_epoch"), (int, float)) and not isinstance(row["fields"]["best_epoch"], bool)
+                   and not any(key in row["fields"] for key in target_keys)}
+    best_names = {"best", "best_model", "model_best"}
+    last_names = {"last", "last_model", "model_last", "latest"}
+    histories = defaultdict(list)
+    for item, row in records:
+        fields = row["fields"]
+        epoch = fields.get("epoch")
+        sequence = PurePosixPath(item.path).suffix.lower() in {".jsonl", ".csv", ".tsv"} or "[" in row["source"][len(item.path):]
+        if sequence and isinstance(epoch, (int, float)) and not isinstance(epoch, bool) and "best_epoch" not in fields and not any(key in fields for key in target_keys):
+            histories[item.id].append(row)
+    for cp in checkpoints:
+        if cp.metadata.get("metric_records"):
+            continue  # Recorded paths / sidecars take precedence over broad conventions.
+        stem = PurePosixPath(cp.path).stem.lower()
+        selected_epoch, basis, confidence = None, "", .6
+        if stem in best_names and sum(PurePosixPath(other.path).stem.lower() in best_names for other in checkpoints) == 1:
+            if len(best_epochs) != 1:
+                continue
+            selected_epoch = next(iter(best_epochs))
+            basis, confidence = "Inferred from best filename and recorded best_epoch", .7
+            for _, row in records:
+                if row["fields"].get("best_epoch") == selected_epoch and not any(key in row["fields"] for key in target_keys):
+                    add(cp, row, values(row["fields"], best=True), confidence, basis)
+        else:
+            match = re.fullmatch(r"(?:.*[_-])?epoch[=_-]?(\d+)", stem)
+            if match:
+                selected_epoch = int(match.group(1))
+                basis = "Inferred from epoch in filename; numbering not verified"
+            elif stem in last_names and sum(PurePosixPath(other.path).stem.lower() in last_names for other in checkpoints) == 1:
+                basis = "Inferred from last filename and final recorded epoch; save not verified"
+                confidence = .55
+            else:
+                continue
+        for item in members:
+            rows = histories.get(item.id, [])
+            if not rows:
+                continue
+            if selected_epoch is None:
+                epochs = [row["fields"]["epoch"] for row in rows]
+                # Partial or restarted logs cannot establish the final epoch.
+                if not item.metadata.get("_history_complete") or any(a >= b for a, b in zip(epochs, epochs[1:])):
+                    continue
+                selected = [rows[-1]]
+            else:
+                selected = [row for row in rows if row["fields"]["epoch"] == selected_epoch]
+            if len(selected) == 1:
+                add(cp, selected[0], values(selected[0]["fields"]), confidence, basis)
 
 
 def identify(artifacts):
@@ -445,6 +577,13 @@ def identify(artifacts):
                 experiment.checkpoint_count += 1
                 experiment.checkpoint_bytes += item.size
             metadata = item.metadata
+            if item.id not in shared and item.kind in {"config", "metadata", "metrics"}:
+                for key, value in metadata.get("fields", {}).items():
+                    # Only the run's own role declarations, not nested component
+                    # summaries or a role borrowed from its parent's config.
+                    leaf = key.rsplit(".", 1)[-1]
+                    if leaf in {"phase", "stage", "modality", "component"} and key in {leaf, "train." + leaf, "model." + leaf} and isinstance(value, str) and value and value != "[REDACTED]":
+                        experiment.role_sources.setdefault(leaf, []).append({"artifact": item.path, "field": key, "value": value})
             if item.kind == "config":
                 for key, value in metadata.get("fields", {}).items():
                     if value == "[REDACTED]":
@@ -478,5 +617,40 @@ def identify(artifacts):
                 experiment.time_sources.append({"artifact": item.path, "field": entry["field"], "type": key, "value": value})
             experiment.warnings.extend(f"{item.path}: {message}" for message in item.warnings)
         experiment.script_hashes = sorted(experiment.script_sources)
+        for role, sources in experiment.role_sources.items():
+            values = {source["value"] for source in sources}
+            if len(values) == 1:
+                experiment.roles[role] = next(iter(values))
+            else:
+                experiment.warnings.append(f"Conflicting {role} declarations; role left unknown.")
         experiment.warnings = sorted(set(experiment.warnings))
+        checkpoint_metrics([item for item in members if item.id not in shared])
+    # Keep directory membership separate from model lineage. Checkpoints retain
+    # one owner; collection totals are summaries, never additional files.
+    by_path = {experiment.path: experiment for experiment in experiments}
+    for experiment in experiments:
+        for folder in [PurePosixPath(experiment.path), *PurePosixPath(experiment.path).parents]:
+            parent = by_path.get(str(folder))
+            if parent:
+                parent.subtree_checkpoint_count += experiment.checkpoint_count
+                parent.subtree_checkpoint_bytes += experiment.checkpoint_bytes
+    for experiment in experiments:
+        if experiment.checkpoint_count == 0 and experiment.subtree_checkpoint_count:
+            experiment.kind = "collection"
+    collections = {experiment.path: experiment for experiment in experiments if experiment.kind == "collection"}
+    for experiment in sorted(experiments, key=lambda item: item.path):
+        for ancestor in PurePosixPath(experiment.path).parents:
+            parent = collections.get(str(ancestor))
+            if parent:
+                experiment.parent_id = parent.id
+                parent.children.append(experiment.id)
+                break
+    # A sidecar can describe a loose checkpoint even when its run is unknown.
+    candidates = {experiment.id for experiment in experiments if experiment.kind == "checkpoint_candidate"}
+    folders = {str(PurePosixPath(item.path).parent) for item in artifacts if ownership.get(item.id) in candidates}
+    for folder in folders:
+        checkpoint_metrics([item for item in by_dir[folder] if item.id not in ownership or ownership[item.id] in candidates])
+    for item in artifacts:
+        item.metadata.pop("_metric_rows", None)
+        item.metadata.pop("_history_complete", None)
     return sorted(experiments, key=lambda item: item.path), ownership

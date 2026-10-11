@@ -31,6 +31,7 @@ td.name { width: 56%; }
 .date { white-space: nowrap; }
 .experiment-link, .back, .related-link { padding: 0; border: 0; background: none; text-align: left; }
 .experiment-link { display: block; font-weight: 550; overflow-wrap: anywhere; }
+.related-link { max-width: 100%; overflow-wrap: anywhere; }
 .experiment-link:hover, .related-link:hover, .back:hover { text-decoration: underline; }
 .experiment-row:hover { background: #fafbfc; }
 .uncertain { display: inline-block; font-size: 11px; font-weight: 400; color: #8b651d; margin-left: 8px; }
@@ -42,7 +43,7 @@ summary { cursor: pointer; }
 .fold { border-top: 1px solid #e5e7eb; padding-top: 14px; }
 .fold > summary { font-weight: 550; }
 .relationship { border-bottom: 1px solid #eceef0; padding: 12px 0; }
-.relation-description { color: #687079; font-size: 12px; }
+.relation-description { color: #687079; font-size: 12px; overflow-wrap: anywhere; }
 .relationship details { margin: 6px 0 0; font-size: 12px; }
 .evidence { margin: 8px 0; padding-left: 18px; overflow-wrap: anywhere; }
 .kv { table-layout: fixed; }
@@ -157,7 +158,7 @@ function describe(edge, selected) {
   if (edge.kind === 'references') return incoming ? 'Uses a checkpoint from' : 'Checkpoint used by';
   if (edge.kind === 'same_artifact') return 'Has an identical checkpoint';
   if (edge.kind === 'possible_derivation') return incoming ? 'May continue from' : 'May be continued by';
-  return 'Similar configuration or code';
+  return edge.description || 'Similar configuration or code';
 }
 
 function renderList() {
@@ -174,9 +175,10 @@ function renderList() {
     button.onclick = () => showExperiment(item.id);
     name.append(button);
     if (item.kind === 'checkpoint_candidate') button.append(element('span', 'Run unknown', 'uncertain'));
+    if (item.kind === 'collection') name.append(element('div', `Collection · ${item.children.length} sub-experiments`, 'path'));
     name.append(element('div', item.path, 'path'));
-    row.append(name, element('td', String(item.checkpoint_count), 'number'),
-      element('td', size(item.checkpoint_bytes), 'number'), element('td', modified(item.modified), 'date'));
+    row.append(name, element('td', item.kind === 'collection' ? `${item.subtree_checkpoint_count} total` : String(item.checkpoint_count), 'number'),
+      element('td', size(item.kind === 'collection' ? item.subtree_checkpoint_bytes : item.checkpoint_bytes), 'number'), element('td', modified(item.modified), 'date'));
     $('experiment-list').append(row);
   }
   const matches = new Set(matching.map(item => item.id));
@@ -207,6 +209,16 @@ function fileTable(parent, members) {
   for (const file of members) {
     const row = element('tr'), name = element('td');
     name.append(element('div', file.path.split('/').pop()), element('div', file.path, 'path'));
+    const records = file.metadata?.metric_records || [];
+    if (records.length) {
+      const details = fold(name, 'Checkpoint metrics', parent => {
+        for (const record of records) {
+          parent.append(element('p', `${record.basis} · Confidence: ${Math.round(record.confidence * 100)}%`, 'muted'));
+          valueTable(parent, record.values, Object.fromEntries(Object.keys(record.values).map(key => [key, record.source])));
+        }
+      });
+      details.dataset.checkpoint = file.id;
+    }
     row.append(name, element('td', size(file.size), 'number'), element('td', modified(file.modified), 'date'));
     body.append(row);
   }
@@ -227,6 +239,7 @@ function valueTable(parent, values, sources) {
     const name = prefix && key.startsWith(prefix) ? key.slice(prefix.length) : key;
     const paths = Array.isArray(source) ? [...new Set(source.map(item => item.artifact))] : source ? [source] : ['—'];
     for (const file of paths) path.append(element('div', file));
+    if (Array.isArray(source) && source.some(item => item.inherited)) path.append(element('div', 'Shared parent config (inferred)', 'muted'));
     row.append(element('td', name), element('td', typeof value === 'object' ? JSON.stringify(value) : String(value)), path);
     body.append(row);
   }
@@ -247,6 +260,19 @@ function evidenceList(parent, edge) {
   }
   for (const caveat of edge.caveats) list.append(element('li', caveat));
   parent.append(list);
+  if (Object.keys(edge.changes || {}).length) {
+    parent.append(element('p', `Recorded differences: ${byId.get(edge.source).path} vs ${byId.get(edge.target).path}`, 'path'));
+    const table = element('table', undefined, 'kv'), head = element('tr');
+    for (const label of ['Name', 'First', 'Second']) head.append(element('th', label));
+    const thead = element('thead'); thead.append(head); table.append(thead);
+    const body = element('tbody');
+    for (const [key, change] of Object.entries(edge.changes)) {
+      const row = element('tr');
+      for (const value of [key, change.source ?? '(not recorded)', change.target ?? '(not recorded)']) row.append(element('td', String(value)));
+      body.append(row);
+    }
+    table.append(body); const wrap = element('div', undefined, 'table-wrap'); wrap.append(table); parent.append(wrap);
+  }
 }
 
 function relationshipList(parent, edges, id) {
@@ -293,17 +319,35 @@ function showExperiment(id) {
   $('detail').hidden = false;
   const panel = $('experiment-detail'); panel.replaceChildren();
   const heading = element('div', undefined, 'detail-header');
+  const collection = item.kind === 'collection';
   heading.append(element('h2', item.name), element('div', item.path, 'path'),
-    element('p', `${item.checkpoint_count} checkpoints · ${size(item.checkpoint_bytes)} · Modified ${modified(item.modified)}`, 'muted'));
+    element('p', collection ? `Collection · ${item.children.length} sub-experiments · ${item.subtree_checkpoint_count} checkpoints total · ${size(item.subtree_checkpoint_bytes)}` : `${item.checkpoint_count} checkpoints · ${size(item.checkpoint_bytes)} · Modified ${modified(item.modified)}`, 'muted'));
+  if (item.parent_id) {
+    const parent = byId.get(item.parent_id), button = element('button', `Collection: ${parent.name}`, 'related-link');
+    button.dataset.collection = parent.id; button.onclick = () => showExperiment(parent.id); heading.append(button);
+  }
+  if (Object.keys(item.roles || {}).length && !collection) heading.append(element('p', Object.entries(item.roles).map(([key, value]) => `${key}: ${value}`).join(' · '), 'muted'));
   if (item.kind === 'checkpoint_candidate') heading.append(element('p', 'This checkpoint could not be linked to a specific run.', 'notice'));
   panel.append(heading);
+  if (collection) {
+    const children = element('section'); children.id = 'collection-members';
+    children.append(element('h3', 'Sub-experiments'), element('p', 'Directory membership; this does not imply model inheritance.', 'muted'));
+    for (const childId of item.children) {
+      const child = byId.get(childId), row = element('div', undefined, 'relationship');
+      const button = element('button', item.path === '.' ? child.path : child.path.slice(item.path.length + 1), 'related-link');
+      button.title = child.path;
+      button.dataset.child = childId; button.onclick = () => showExperiment(childId);
+      row.append(button, element('div', `${child.kind === 'collection' ? child.subtree_checkpoint_count : child.checkpoint_count} checkpoints`, 'path')); children.append(row);
+    }
+    panel.append(children);
+  }
   const related = [...links.get(id)].sort((a, b) => b.confidence - a.confidence);
   const sources = related.filter(edge => edge.directed && edge.target === id);
   const downstream = related.filter(edge => edge.directed && edge.source === id);
   const origin = element('section', undefined, 'origin'); origin.id = 'origin';
   origin.append(element('h3', 'Sources'));
-  if (!sources.some(edge => edge.kind === 'derived_from')) {
-    origin.append(element('p', sources.length ? 'No recorded continuation found. Checkpoint use and possible sources are listed below.' : 'Origin unknown: no source link found. Similarity alone cannot establish where this experiment came from.', 'muted'));
+  if (collection || !sources.some(edge => edge.kind === 'derived_from')) {
+    origin.append(element('p', collection ? "Shared sources; check each sub-experiment's own evidence." : sources.length ? 'No recorded continuation found. Checkpoint use and possible sources are listed below.' : 'Origin unknown: no source link found. Similarity alone cannot establish where this experiment came from.', 'muted'));
   }
   relationshipList(origin, sources, id);
   for (const reference of item.references.filter(ref => ['unresolved', 'ambiguous'].includes(ref.resolution))) {
@@ -333,11 +377,16 @@ function showExperiment(id) {
     parent.append(element('p', 'These links do not establish origin or copy direction.', 'muted'));
     relationshipList(parent, similar, id);
   });
-  panel.append(element('h3', 'Checkpoints'));
   const members = item.artifacts.map(key => files.get(key)).filter(Boolean);
-  fileTable(panel, members.filter(file => file.kind === 'checkpoint'));
+  if (!collection) {
+    panel.append(element('h3', 'Checkpoints'));
+    fileTable(panel, members.filter(file => file.kind === 'checkpoint'));
+  }
   if (Object.keys(item.config).length) fold(panel, `Configuration (${Object.keys(item.config).length})`, parent => valueTable(parent, item.config, item.config_sources));
-  if (Object.keys(item.metrics).length) fold(panel, `Metrics (${Object.keys(item.metrics).length})`, parent => valueTable(parent, item.metrics, item.metric_sources));
+  if (Object.keys(item.metrics).length) fold(panel, `Metrics (${Object.keys(item.metrics).length})`, parent => {
+    parent.append(element('p', 'Run summaries / last parsed log values; not necessarily a particular checkpoint.', 'muted'));
+    valueTable(parent, item.metrics, item.metric_sources);
+  });
   const otherFiles = members.filter(file => file.kind !== 'checkpoint');
   if (otherFiles.length) fold(panel, `Other files (${otherFiles.length})`, parent => fileTable(parent, otherFiles));
   if (item.warnings.length) fold(panel, `Notes (${item.warnings.length})`, parent => {
@@ -482,18 +531,18 @@ function renderGraph(parent, nodes, edges, selectedId = null) {
     const tentative = edge.kind === 'possible_derivation';
     const line = svgNode('path', {d: route, fill: 'none', stroke: tentative ? '#af7a28' : edge.directed ? '#527c9d' : '#a0acb8', 'stroke-width': edge.directed ? 1.8 : 1, class: edge.directed ? 'graph-edge' : 'graph-edge secondary', 'data-id': edge.id, 'data-source': edge.source, 'data-target': edge.target});
     if (edge.directed) line.setAttribute('marker-end', `url(#${arrowId})`);
-    const title = svgNode('title'); title.textContent = `${labels[edge.kind]} · ${Math.round(edge.confidence * 100)}% confidence`;
+    const title = svgNode('title'); title.textContent = `${edge.description || labels[edge.kind]} · ${Math.round(edge.confidence * 100)}% confidence`;
     line.append(title); svg.append(line);
   });
   for (const item of nodes) {
     const {x, y} = points.get(item.id), current = item.id === selectedId;
     const group = svgNode('g', {transform: `translate(${x} ${y})`, class: 'graph-node', 'data-id': item.id, tabindex: 0, role: 'button', 'aria-label': item.path});
-    group.append(svgNode('rect', {width: 220, height: 56, rx: 5, fill: current ? '#e8f2fc' : 'white', stroke: current ? '#3579bd' : '#c8d1da'}));
+    group.append(svgNode('rect', {width: 220, height: 56, rx: 5, fill: current ? '#e8f2fc' : item.kind === 'collection' ? '#f3f5f7' : 'white', stroke: current ? '#3579bd' : '#c8d1da'}));
     const title = svgNode('title'); title.textContent = item.path; group.append(title);
     const name = svgNode('text', {x: 12, y: 24, fill: '#24292f', 'font-size': 12});
     name.textContent = item.name.length > 28 ? item.name.slice(0, 26) + '…' : item.name;
     const hint = svgNode('text', {x: 12, y: 44, fill: '#687079', 'font-size': 10});
-    hint.textContent = item.path.length > 32 ? '…' + item.path.slice(-30) : item.path;
+    hint.textContent = item.kind === 'collection' ? `Collection · ${item.children.length} runs · ${item.subtree_checkpoint_count} checkpoints` : item.path.length > 32 ? '…' + item.path.slice(-30) : item.path;
     group.append(name, hint);
     group.onclick = () => showExperiment(item.id);
     const highlight = active => {
@@ -539,7 +588,8 @@ function showOverview(view) {
 function renderOverviewGraph() {
   const edges = REPORT.edges.filter(edge => edge.directed || $('include-similar').checked);
   const sourceCount = edges.filter(edge => edge.directed).length;
-  $('graph-count').textContent = `${experiments.length} experiments · ${sourceCount} source links${edges.length > sourceCount ? ` · ${edges.length - sourceCount} similarity / identical-file links` : ''}. Experiments without links are shown separately.`;
+  const collections = experiments.filter(item => item.kind === 'collection').length;
+  $('graph-count').textContent = `${experiments.length - collections} experiments${collections ? ` · ${collections} collections` : ''} · ${sourceCount} source links${edges.length > sourceCount ? ` · ${edges.length - sourceCount} similarity / identical-file links` : ''}. Experiments without links are shown separately.`;
   renderGraph($('global-graph'), experiments, edges);
   renderList();
 }
