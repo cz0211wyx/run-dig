@@ -6,7 +6,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from runshelf.cli import main
 from runshelf.scan import analyze
@@ -37,6 +39,135 @@ class PipelineTests(unittest.TestCase):
 
     def report(self, **kwargs):
         return analyze(self.root, **kwargs)
+
+    def npz(self, path, names=("W1", "b1", "epoch")):
+        file = self.put(path, b"")
+        with zipfile.ZipFile(file, "w") as archive:
+            for name in names:
+                # Recognition must not read array payloads, including object arrays.
+                archive.writestr(name + ".npy", b"opaque array payload")
+        return file
+
+    def test_npz_parameters_recognized_and_feature_caches_excluded(self):
+        self.npz("new folder/final_final2.NPZ")
+        self.npz("another folder/arbitrary.npz", ("dense/kernel", "dense/bias"))
+        self.npz("checkpoints/best.npz", ("features", "ids"))
+        self.npz("cache/weights.npz", ("weights", "labels"))
+        self.npz("checkpoints/predictions_by_epoch.npz", ("probabilities", "predicted_scores"))
+        self.npz("reports/ig_full_final.npz", ("positions", "residual", "steps"))
+        self.npz("data/unknown.npz", ("arr_0",))
+        report = self.report(hash_limit=0)
+        self.assertEqual({a.path for a in report.artifacts if a.kind == "checkpoint"},
+                         {"new folder/final_final2.NPZ", "another folder/arbitrary.npz"})
+
+    def test_npz_opaque_arrays_are_not_deserialized(self):
+        self.npz("snapshot.npz", ("layer.weight", "layer.bias"))
+        with patch.object(zipfile.ZipFile, "open", side_effect=AssertionError("Array payload read")):
+            self.assertEqual(self.report().statistics["checkpoints"], 1)
+
+    def test_npz_naming_fallback_and_broken_archives_keep_notes(self):
+        self.npz("checkpoints/something.npz", ("arr_0",))
+        broken = self.put("run/epoch_50.npz", b"PK\x03\x04truncated")
+        self.put("unknown.npz", b"not a zip")
+        report = self.report()
+        self.assertEqual(report.statistics["checkpoints"], 2)
+        self.assertTrue(all(a.warnings for a in report.artifacts if a.kind == "checkpoint"))
+        self.assertTrue(any(w["path"] == "unknown.npz" for w in report.warnings))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(["inspect", str(broken)]), 0)
+        self.assertIn("Cannot read NPZ archive", output.getvalue())
+
+    def test_npz_inspection_limit_is_reported(self):
+        self.npz("run/best.npz")
+        self.npz("unknown.npz")
+        with patch("runshelf.scan.NPZ_INSPECTION_LIMIT", 1):
+            with patch("runshelf.scan.zipfile.ZipFile", side_effect=AssertionError("Oversized archive opened")):
+                report = self.report(hash_limit=0)
+        self.assertEqual(report.statistics["checkpoints"], 1)
+        self.assertEqual(len(report.warnings), 2)
+        self.assertTrue(all("inspection skipped" in w["message"] for w in report.warnings))
+
+    def test_npz_resume_and_evaluation_paths_are_resolved(self):
+        self.npz("base/checkpoints/last.npz")
+        self.put("base/config.json", {"lr": .1, "seed": 17})
+        self.npz("resumed/checkpoints/best.npz")
+        self.put("resumed/config.json", {"lr": .1, "seed": 17,
+                                         "resume": r"base\checkpoints\last.npz"})
+        self.put("resumed/eval.json", {"checkpoint": r"resumed\checkpoints\best.npz",
+                                      "best_epoch": 14, "accuracy": .9, "macro_f1": .8})
+        report = self.report(hash_limit=0)
+        names = {e.id: e.path for e in report.experiments}
+        self.assertEqual([(names[e.source], names[e.target]) for e in report.edges if e.kind == "derived_from"],
+                         [("base", "resumed")])
+        self.assertEqual(report.statistics["unresolved_references"], 0)
+        records = self.checkpoint_records(report, "resumed/checkpoints/best.npz")
+        self.assertEqual(records[0]["values"], {"best_epoch": 14, "accuracy": .9, "macro_f1": .8})
+        self.assertEqual(records[0]["confidence"], .95)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(["compare", "base/checkpoints/last.npz", "resumed/checkpoints/best.npz",
+                                   "--root", str(self.root)]), 0)
+        self.assertIn("A -> B: derived from", output.getvalue())
+        self.assertIn("accuracy", output.getvalue())
+
+    def test_npz_references_do_not_turn_data_into_models(self):
+        self.npz("features/cache.npz", ("features", "ids"))
+        self.npz("run/best.npz")
+        self.put("run/config.json", {"lr": .1, "seed": 17, "resume": "features/cache.npz"})
+        report = self.report()
+        self.assertEqual(report.statistics["checkpoints"], 1)
+        self.assertEqual(report.statistics["unresolved_references"], 1)
+        self.assertFalse(any(e.directed for e in report.edges))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["inspect", "features/cache.npz", "--root", str(self.root)]), 2)
+
+    def test_checkpoint_records_do_not_link_prediction_caches(self):
+        self.npz("run/best.npz")
+        self.npz("run/predictions_by_epoch.npz", ("probabilities", "predicted_scores"))
+        self.put("consumer/config.json", {"lr": .1, "seed": 17, "checkpoints": [
+            {"checkpoint": "run/best.npz", "prediction_cache": "run/predictions_by_epoch.npz"}]})
+        self.put("consumer/best.pt", b"model")
+        report = self.report(hash_limit=0)
+        consumer = next(e for e in report.experiments if e.path == "consumer")
+        self.assertEqual([r["value"] for r in consumer.references], ["run/best.npz"])
+        self.assertEqual(report.statistics["unresolved_references"], 0)
+
+    def test_npz_checkpoint_folder_and_metrics_establish_run_without_config(self):
+        self.npz("missing config/checkpoints/best.npz")
+        self.npz("missing config/checkpoints/last.npz")
+        self.put("missing config/metrics.csv", "epoch,loss\n1,0.8\n2,0.4\n")
+        self.put("missing config/eval.json", {"checkpoint": "checkpoints/best.npz", "accuracy": .9})
+        report = self.report()
+        self.assertEqual([(e.path, e.checkpoint_count) for e in report.experiments], [("missing config", 2)])
+        self.assertEqual(self.checkpoint_records(report, "missing config/checkpoints/best.npz")[0]["values"],
+                         {"accuracy": .9})
+
+    def test_npz_references_from_logs_scripts_and_manifests(self):
+        for name in ("base", "logged", "scripted", "stage"):
+            self.npz(name + "/best.npz")
+            self.put(name + "/config.json", {"lr": .1, "seed": 17})
+        self.put("logged/train.log", 'Resuming from "../base/best.npz"')
+        self.put("scripted/train.py", 'resume = "../base/best.npz"\nmodel = load_checkpoint(resume)')
+        self.put("stages.json", {"stages": [
+            {"name": "first", "checkpoint": "base/best.npz"},
+            {"name": "second", "checkpoint": "stage/best.npz", "resume": "first"}]})
+        report = self.report(hash_limit=0)
+        names = {e.id: e.path for e in report.experiments}
+        self.assertEqual({(names[e.source], names[e.target]) for e in report.edges if e.directed},
+                         {("base", "logged"), ("base", "scripted"), ("base", "stage")})
+
+    def test_npz_and_safetensors_in_terminal_listing(self):
+        self.npz("run/best.npz")
+        self.npz("features/best.npz", ("features", "ids"))
+        self.put("run/best.safetensors", b"opaque")
+        self.put("run/best.pt", b"opaque")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(["list", str(self.root), "--name", "best"]), 0)
+        self.assertIn("Found 3 checkpoints", output.getvalue())
+        self.assertIn("best.npz", output.getvalue())
+        self.assertNotIn("features", output.getvalue())
 
     def test_existing_listing_sort_and_filter(self):
         self.put("a/best.PTH", b"12")
@@ -69,6 +200,44 @@ class PipelineTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(len(report.experiments), 1)
         self.assertEqual(report.experiments[0].config["seed"], 42)
+
+    def test_shared_project_config_does_not_describe_copied_child_checkpoint(self):
+        self.run_folder('runs/one')
+        self.put('configs/base.json', {'lr': .2, 'epochs': 40, 'batch_size': 32})
+        self.put('checkpoints/best.pt', b'runs/one')
+        report = self.report()
+        nodes = {node.path: node for node in report.experiments}
+        self.assertNotIn('.', nodes)
+        copied = nodes['checkpoints/best.pt']
+        self.assertEqual(copied.kind, 'checkpoint_candidate')
+        self.assertEqual(copied.config, {})
+        self.assertTrue(any('was not bound' in note for note in copied.warnings))
+        relations = [edge for edge in report.edges if copied.id in (edge.source, edge.target)]
+        self.assertEqual([edge.kind for edge in relations], ['same_artifact'])
+        self.assertFalse(relations[0].directed)
+        # Missing hashes cannot establish that these are copies.
+        self.assertIn('.', [node.path for node in self.report(hash_limit=0).experiments])
+
+    def test_support_config_runs_keep_independent_training_evidence(self):
+        for case in ('single', 'different', 'log', 'state', 'reference', 'hydra'):
+            folder = '.hydra' if case == 'hydra' else 'configs'
+            config = {'lr': .1, 'epochs': 3, 'batch_size': 16}
+            if case == 'reference':
+                config['checkpoint'] = 'checkpoints/best.pt'
+            self.put(f'{case}/{folder}/config.json', config)
+            if case != 'single':
+                self.run_folder(f'{case}/runs/one')
+            content = b'own weights' if case in {'single', 'different'} else f'{case}/runs/one'.encode()
+            self.put(f'{case}/checkpoints/best.pt', content)
+            if case == 'log':
+                self.put(f'{case}/train.log', 'epoch=3 loss=0.2')
+            if case == 'state':
+                self.put(f'{case}/state.json', {'started_at_utc': '2026-01-01T00:00:00Z'})
+        nodes = {node.path: node for node in self.report().experiments}
+        for case in ('single', 'different', 'log', 'state', 'reference', 'hydra'):
+            with self.subTest(case=case):
+                self.assertEqual(nodes[case].kind, 'experiment')
+                self.assertEqual(nodes[case].config['lr'], .1)
 
     def test_nested_run_not_swallowed_by_parent(self):
         self.run_folder("parent")
@@ -306,6 +475,48 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(self.checkpoint_records(self.report(), 'run/last.pt'))
         self.put('run/history.jsonl', '{"epoch":1,"loss":2}\n' * 100)
         self.assertFalse(self.checkpoint_records(self.report(text_limit=300), 'run/last.pt'))
+
+    def test_resumed_last_uses_continuation_but_epoch_and_best_keep_prior_history(self):
+        self.run_folder('run', resume_from='../base/last.pt')
+        self.put('run/last.pt', b'last')
+        self.put('run/epoch-2.pt', b'epoch two')
+        self.put('run/train.log', 'resume_epoch=2')
+        self.put('run/continuation.csv', 'epoch,loss\n3,0.8\n4,0.6\n')
+        self.put('run/summary.json', {'best_epoch': 2})
+        report = self.report()
+        records = self.checkpoint_records(report, 'run/last.pt')
+        self.assertEqual([record['values']['epoch'] for record in records], [4])
+        self.assertIn('resume_epoch=2', records[0]['basis'])
+        self.assertIn('run/train.log', records[0]['basis'])
+        self.assertEqual(records[0]['confidence'], .55)
+        for path in ('run/best.pt', 'run/epoch-2.pt'):
+            self.assertTrue(any(record['source'].startswith('run/history.jsonl') and record['values']['epoch'] == 2
+                                for record in self.checkpoint_records(report, path)))
+        self.put('run/last.metrics.json', {'epoch': 3, 'loss': .7})
+        records = self.checkpoint_records(self.report(), 'run/last.pt')
+        self.assertEqual([record['values']['epoch'] for record in records], [3])
+        self.assertIn('Matching metadata filename', records[0]['basis'])
+
+    def test_resume_history_requires_unambiguous_adjacent_boundary(self):
+        cases = {
+            'no-path': ({}, 'resume_epoch=2', '3,0.8\n4,0.6\n'),
+            'no-boundary': ({'resume_from': '../base/last.pt'}, '', '3,0.8\n4,0.6\n'),
+            'conflicting-paths': ({'resume_from': '../base/last.pt', 'resume': '../other/last.pt'}, 'resume_epoch=2', '3,0.8\n4,0.6\n'),
+            'conflicting-boundaries': ({'resume_from': '../base/last.pt', 'resume_epoch': 1}, 'resume_epoch=2', '3,0.8\n4,0.6\n'),
+            'overlap': ({'resume_from': '../base/last.pt'}, 'resume_epoch=2', '2,0.8\n4,0.6\n'),
+            'gap': ({'resume_from': '../base/last.pt'}, 'resume_epoch=2', '4,0.6\n'),
+        }
+        for name, (config, log, rows) in cases.items():
+            self.run_folder(name, **config)
+            self.put(f'{name}/last.pt', b'last')
+            self.put(f'{name}/train.log', log)
+            self.put(f'{name}/history_old.csv', 'epoch,loss\n' + rows)
+        report = self.report()
+        for name in cases:
+            with self.subTest(case=name):
+                records = self.checkpoint_records(report, f'{name}/last.pt')
+                self.assertEqual({record['values']['epoch'] for record in records}, {2, 4})
+                self.assertTrue(all(record['confidence'] == .4 for record in records))
 
     def test_metric_record_limit_does_not_imply_final_epoch(self):
         from runshelf.metadata import extract, checkpoint_metrics
@@ -568,6 +779,54 @@ class PipelineTests(unittest.TestCase):
             self.assertIn(field, relation.changes)
             self.assertFalse(relation.directed)
 
+    def test_missing_setting_is_not_a_change_or_tentative_ancestry(self):
+        self.run_folder('one', hidden_size=32)
+        self.run_folder('two')
+        for name, date in [('one', '2026-01-01'), ('two', '2026-01-02')]:
+            self.put(f'{name}/source/train.py', '# identical code\n')
+            self.put(f'{name}/state.json', {'started_at_utc': date + 'T00:00:00Z', 'finished_at_utc': date + 'T01:00:00Z'})
+        relation = self.report().edges[0]
+        self.assertEqual(relation.kind, 'similar_to')
+        self.assertEqual(relation.changes, {})
+        self.assertAlmostEqual(relation.confidence, .85)  # Union-based score is unchanged.
+        self.assertIn('full configuration uncertain', relation.description)
+        unavailable = next(fact['fields'] for fact in relation.evidence if fact['signal'] == 'unavailable comparison fields')
+        self.assertEqual(unavailable, ['train.hidden_size'])
+
+    def test_conflicting_settings_on_either_side_are_unknown_not_differences(self):
+        for name in ('one', 'two'):
+            self.run_folder(name, hidden_size=32, seed=42)
+            self.put(f'{name}/source/train.py', '# identical code\n')
+            self.put(f'{name}/other_config.json', {'train': {'hidden_size': 64, 'seed': 17}})
+        report = self.report()
+        relation = report.edges[0]
+        self.assertEqual(relation.changes, {})
+        self.assertIn('full configuration uncertain', relation.description)
+        unavailable = next(fact['fields'] for fact in relation.evidence if fact['signal'] == 'unavailable comparison fields')
+        self.assertEqual(set(unavailable), {'train.hidden_size', 'seed'})
+        self.assertTrue(all(len(node.config_sources['train.hidden_size']) == 2 for node in report.experiments))
+
+    def test_partial_config_does_not_claim_seed_is_only_difference(self):
+        self.run_folder('one', seed=1, hidden_size=32)
+        self.run_folder('two', seed=2)
+        for name in ('one', 'two'):
+            self.put(f'{name}/source/train.py', '# identical code\n')
+        relation = self.report().edges[0]
+        self.assertEqual(set(relation.changes), {'seed'})
+        self.assertIn('configuration partly comparable', relation.description)
+        self.assertNotIn('except seed', relation.description)
+
+    def test_confirmed_difference_survives_missing_other_settings(self):
+        options = {'dropout': .1, 'layers': 2, 'optimizer': 'adam'}
+        self.run_folder('one', hidden_size=32, **options)
+        self.run_folder('two', lr=.002, **options)
+        for name in ('one', 'two'):
+            self.put(f'{name}/source/train.py', '# identical code\n')
+        relation = self.report().edges[0]
+        self.assertEqual(set(relation.changes), {'train.lr'})
+        self.assertIn('Training settings differ', relation.description)
+        self.assertTrue(any('Missing or conflicting' in note for note in relation.caveats))
+
     def test_conflicting_roles_do_not_produce_seed_variant_claim(self):
         self.run_folder('one', seed=1)
         self.run_folder('two', seed=2)
@@ -746,6 +1005,148 @@ class PipelineTests(unittest.TestCase):
         run = self.report().experiments[0]
         self.assertEqual(len(run.config_sources['train.lr']), 2)
         self.assertTrue(any('Conflicting config' in w for w in run.warnings))
+
+    def test_inspect_prints_each_conflicting_config_value_with_its_source(self):
+        self.run_folder('run', seed=42)
+        self.put('run/args.json', {'train': {'seed': 2024, 'lr': .001}})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(['inspect', str(self.root / 'run/best.pt')]), 0)
+        text = output.getvalue()
+        self.assertIn('train.seed: Conflicting values', text)
+        self.assertIn('2024 | args.json', text)
+        self.assertIn('42 | config.json', text)
+
+    def test_conflicting_export_sources_preserve_both_accounts(self):
+        self.run_folder('base')
+        self.run_folder('old')
+        self.run_folder('export', teacher_checkpoint='../old/best.pt')
+        self.put('export/source.txt', r'base\best.pt')
+        self.put('export/eval.json', {'checkpoint': 'old/best.pt', 'accuracy': .8})
+        report = self.report(hash_limit=0)
+        run = next(e for e in report.experiments if e.path == 'export')
+        incoming = [e for e in report.edges if e.target == run.id and e.directed]
+        self.assertEqual(len(incoming), 2)
+        self.assertTrue(all(e.kind == 'references' and e.confidence <= .5 for e in incoming))
+        self.assertTrue(all(e.description == 'Conflicting source records' for e in incoming))
+        self.assertTrue(any('Origin is uncertain' in w for w in run.warnings))
+        self.assertEqual({r['artifact'] for r in run.references if r.get('conflict')},
+                         {'export/source.txt', 'export/eval.json'})
+
+    def test_matching_export_source_and_self_evaluation_are_not_conflicts(self):
+        self.run_folder('base')
+        self.run_folder('export')
+        self.put('export/source.txt', 'base/best.pt')
+        self.put('export/eval.json', {'checkpoint': 'export/best.pt', 'accuracy': .8})
+        report = self.report(hash_limit=0)
+        self.assertFalse(any('Conflicting source' in w for e in report.experiments for w in e.warnings))
+        self.assertEqual([e.confidence for e in report.edges if e.directed], [.9])
+
+    def test_conflicting_resume_configs_lower_confidence(self):
+        for name in ['base', 'other']:
+            self.run_folder(name)
+        self.run_folder('resumed', resume='../base/best.pt')
+        self.put('resumed/args.json', {'train': {'resume': '../other/best.pt', 'lr': .001}})
+        edges = [e for e in self.report(hash_limit=0).edges if e.directed]
+        self.assertEqual(len(edges), 2)
+        self.assertTrue(all(e.confidence <= .5 for e in edges))
+
+    def test_wandb_copy_attaches_to_run_without_duplicate_node(self):
+        self.run_folder('run', seed=17)
+        config = json.loads((self.root / 'run/config.json').read_text())
+        self.put('wandb/offline-run-copy/files/config.json', config)
+        self.put('wandb/offline-run-copy/files/wandb-summary.json', {'checkpoint': 'run/best.pt', 'accuracy': .9})
+        report = self.report(hash_limit=0)
+        self.assertEqual(len(report.experiments), 1)
+        run = report.experiments[0]
+        self.assertEqual(run.path, 'run')
+        self.assertEqual(run.checkpoint_count, 1)
+        self.assertTrue(any('Tracking records attached' in e for e in run.evidence))
+        copied = [a for a in report.artifacts if a.path.startswith('wandb/')]
+        self.assertTrue(all(a.id in run.artifacts and a.metadata['tracking_copy_of'] == 'run' for a in copied))
+        checkpoint = next(a for a in report.artifacts if a.kind == 'checkpoint')
+        self.assertEqual(checkpoint.metadata['metric_records'][0]['source'], copied[1].path)
+
+    def test_wandb_recovers_missing_config_from_compatible_log_facts(self):
+        self.put('run/checkpoints/best.pt', b'weights')
+        self.put('run/train.log', 'seed=42 hidden=48 lr=0.02\nepoch=1 loss=0.3\n')
+        self.put('wandb/offline-run-copy/files/config.json', {'seed': 42, 'hidden': 48, 'lr': .02})
+        self.put('wandb/offline-run-copy/files/wandb-summary.json', {'checkpoint': 'run/checkpoints/best.pt', 'accuracy': .9})
+        report = self.report(hash_limit=0)
+        self.assertEqual(len(report.experiments), 1)
+        self.assertEqual(report.experiments[0].config['hidden'], 48)
+        self.assertEqual(report.experiments[0].config_sources['hidden'][0]['artifact'], 'wandb/offline-run-copy/files/config.json')
+
+    def test_wandb_conflicting_or_weak_records_stay_separate(self):
+        self.run_folder('run', seed=17)
+        original = json.loads((self.root / 'run/config.json').read_text())
+        for name, config in [('conflict', {**original['train'], 'seed': 42}), ('weak', {'lr': .001, 'seed': 17})]:
+            self.put(f'wandb/offline-run-{name}/files/config.json', {'train': config})
+            self.put(f'wandb/offline-run-{name}/files/wandb-summary.json', {'checkpoint': 'run/best.pt', 'accuracy': .9})
+        report = self.report(hash_limit=0)
+        self.assertEqual(len(report.experiments), 3)
+        self.assertTrue(all(e.name != 'files' for e in report.experiments))
+
+    def test_code_snapshot_and_one_setting_change_link_arbitrary_names(self):
+        self.run_folder('final_final2', balanced=True)
+        self.run_folder('new folder', balanced=False)
+        for name in ['final_final2', 'new folder']:
+            self.put(name + '/code/train.py', 'def train():\n    return 1\n')
+        report = self.report(hash_limit=0)
+        self.assertTrue(all(e.script_hashes for e in report.experiments))
+        relation = next(e for e in report.edges if e.kind == 'similar_to')
+        self.assertEqual(set(relation.changes), {'train.balanced'})
+        self.assertIn('Training settings differ', relation.description)
+        self.assertFalse(any(e.directed for e in report.edges))
+
+    def test_disagreeing_histories_are_flagged_at_checkpoint(self):
+        self.put('run/checkpoints/epoch_10.pt', b'weights')
+        self.put('run/metrics.csv', 'epoch,loss,accuracy\n10,0.4,0.8\n')
+        self.put('run/metrics_old.csv', 'epoch,loss,accuracy\n10,0.7,0.8\n')
+        report = self.report(hash_limit=0)
+        checkpoint = next(a for a in report.artifacts if a.kind == 'checkpoint')
+        self.assertEqual(checkpoint.metadata['metric_conflicts'], ['loss'])
+        records = checkpoint.metadata['metric_records']
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(r['confidence'] <= .4 for r in records))
+        self.assertTrue(any('Metric records disagree' in w for w in checkpoint.warnings))
+        self.assertTrue(any('Metric records disagree' in w for w in report.experiments[0].warnings))
+
+    def test_missing_code_is_unknown_rather_than_different_code(self):
+        self.run_folder('base', hidden=24, dropout=.1, optimizer='adam', dataset='surface')
+        self.run_folder('variant', hidden=48, dropout=.1, optimizer='adam', dataset='surface', lr=.002)
+        self.put('base/code/train.py', 'def train():\n    return 1\n')
+        relations = self.report(hash_limit=0).edges
+        relation = next(e for e in relations if e.kind == 'similar_to')
+        self.assertIn('Model configuration differs', relation.description)
+        self.assertLessEqual(relation.confidence, .7)
+        self.assertTrue(any('Code snapshots are unavailable' in c for c in relation.caveats))
+        self.assertFalse(any(e.directed for e in relations))
+
+    def test_metric_rounding_differences_are_not_conflicts(self):
+        self.put('run/checkpoints/epoch_10.pt', b'weights')
+        self.put('run/metrics.csv', 'epoch,loss\n10,0.333333333333\n')
+        self.put('run/metrics_old.csv', 'epoch,loss\n10,0.33333333\n')
+        checkpoint = next(a for a in self.report().artifacts if a.kind == 'checkpoint')
+        self.assertNotIn('metric_conflicts', checkpoint.metadata)
+
+    def test_mostly_matching_config_with_changed_code_is_still_similar(self):
+        common = {'dataset': 'surface', 'hidden': 24, 'dropout': .1, 'optimizer': 'adam', 'save_every': 10, 'selection': 'accuracy'}
+        self.run_folder('base', **common, split='random', normalize_all=True)
+        self.run_folder('variant', **common, split='group', normalize_all=False)
+        self.put('base/code/train.py', 'def train():\n    return 1\n')
+        self.put('variant/code/train.py', 'def train():\n    return 2\n')
+        relations = self.report(hash_limit=0).edges
+        relation = next(e for e in relations if e.kind == 'similar_to')
+        self.assertIn('Dataset configuration differs', relation.description)
+        self.assertLessEqual(relation.confidence, .7)
+        self.assertTrue(any('Code snapshots differ' in c for c in relation.caveats))
+        self.assertFalse(any(e.directed for e in relations))
+
+    def test_config_only_similarity_requires_more_than_generic_defaults(self):
+        self.run_folder('a', dataset='images', optimizer='adam')
+        self.run_folder('b', dataset='speech', optimizer='sgd')
+        self.assertFalse(any(e.kind == 'similar_to' for e in self.report(hash_limit=0).edges))
 
     def test_ids_stable_across_rescan(self):
         self.run_folder("run")

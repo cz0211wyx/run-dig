@@ -16,7 +16,7 @@ from .models import Artifact, Experiment, stable_id
 
 SECRET = re.compile(r"(^|[._-])(password|secret|api_key|token|access_token|auth_token|credential|credentials|authorization|private_key)([._-]|$)", re.I)
 METRIC = re.compile(r"(^|[._])(loss|accuracy|acc|f1|macro_f1|weighted_f1|mae|mse|rmse|auc|pearson|score|selection_score|best_epoch|epoch|step|epochs)([._]|$)", re.I)
-CHECKPOINT = re.compile(r"\.(pt|pth|ckpt|safetensors)$", re.I)
+CHECKPOINT = re.compile(r"\.(pt|pth|ckpt|safetensors|npz)$", re.I)
 HASH = re.compile(r"^[0-9a-f]{64}$", re.I)
 TRAIN_KEYS = {"seed", "lr", "learning_rate", "epochs", "batch_size", "optimizer", "model_type", "model", "architecture", "dataset", "dropout", "hidden_size"}
 METRIC_TARGET_KEYS = {"checkpoint", "checkpoint_path", "output_checkpoint", "saved_checkpoint", "model_path"}
@@ -70,6 +70,9 @@ def parse_time(value):
 
 def reference_kind(key):
     key = key.lower()
+    leaf = key.rsplit(".", 1)[-1]
+    if leaf in {"features", "predictions", "logits", "probabilities", "labels", "dataset"} or leaf.endswith("_cache"):
+        return None  # A data field inside a checkpoint record is not a model reference.
     if any(word in key for word in ("resume", "init_from", "init_checkpoint", "initial_", "initialization", "parent_run", "warm_start", "finetune_from")):
         return "derived_from"
     if any(word in key for word in ("source_checkpoint", "pretrained", "teacher", "reference", "checkpoint", "load_from",
@@ -177,6 +180,10 @@ def extract_fields(fields, source, *, role):
                 if kind:
                     reference = {"value": value, "resolved_value": expand_reference(value, fields, key),
                                  "field": key, "artifact": source, "kind": kind, "role": role}
+                    if key == "source_checkpoint" and PurePosixPath(source).name.lower() == "source.txt":
+                        reference["purpose"] = "declared_source"
+                    elif role in {"metrics", "metadata"} and key in METRIC_TARGET_KEYS and any(METRIC.search(k) for k in fields):
+                        reference["purpose"] = "evaluation"
                     hash_key = key.rsplit(".", 1)[0] + ".sha256"
                     if HASH.fullmatch(str(fields.get(hash_key, ""))):
                         reference["sha256"] = fields[hash_key].lower()
@@ -359,11 +366,15 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
                 artifact.warnings.append(f"Record limit ({record_limit}) reached; metrics reflect the last parsed record, not necessarily the final epoch.")
             fields = flatten(fields)
         else:
+            if path.name.lower() == "source.txt" and len(text.strip().splitlines()) == 1:
+                value = text.strip().strip('"\'')
+                if CHECKPOINT.search(value):
+                    fields["source_checkpoint"] = value
             # Conservative key=value metadata and explicit checkpoint-loading messages.
             for line in text.splitlines()[:record_limit]:
                 for key, value in re.findall(r"\b([\w.]+)\s*[:=]\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)", line):
                     fields[key] = scalar(float(value))
-                match = re.search(r'''(?:resum\w*|load\w*|initializ\w*|warm.start)\s+(?:\w+\s+){0,3}?(?:from\s+)?(?:["']([^"']+\.(?:pt|pth|ckpt|safetensors))["']|([^\s"']+\.(?:pt|pth|ckpt|safetensors)))''', line, re.I)
+                match = re.search(r'''(?:resum\w*|load\w*|initializ\w*|warm.start)\s+(?:\w+\s+){0,3}?(?:from\s+)?(?:["']([^"']+\.(?:pt|pth|ckpt|safetensors|npz))["']|([^\s"']+\.(?:pt|pth|ckpt|safetensors|npz)))''', line, re.I)
                 if match:
                     prefix = "resume" if "resum" in line.lower() else "checkpoint"
                     fields[f"{prefix}.{len(fields)}"] = match.group(1) or match.group(2)
@@ -386,7 +397,7 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
 
 
 ARTIFACT_FOLDERS = {"checkpoints", "checkpoint", "weights", "ckpts", "models"}
-SUPPORT_FOLDERS = ARTIFACT_FOLDERS | {"logs", "source", "src", "scripts", "configs", ".hydra"}
+SUPPORT_FOLDERS = ARTIFACT_FOLDERS | {"logs", "source", "src", "scripts", "code", "configs", ".hydra"}
 
 
 def checkpoint_metrics(members):
@@ -423,7 +434,7 @@ def checkpoint_metrics(members):
                 paths.update((posixpath.normpath(value), posixpath.normpath(str(PurePosixPath(item.path).parent / value))))
             matches = [cp for cp in checkpoints if cp.path in paths]
             if len(declared) == 1 and len(matches) == 1:
-                add(matches[0], row, values(fields, best="best_epoch" in fields and "epoch" not in fields), .95, "Checkpoint path recorded with metrics")
+                add(matches[0], row, values(fields), .95, "Checkpoint path recorded with metrics")
             continue
         # A matching sidecar is useful evidence, but still a naming convention.
         source = PurePosixPath(item.path)
@@ -446,6 +457,31 @@ def checkpoint_metrics(members):
         sequence = PurePosixPath(item.path).suffix.lower() in {".jsonl", ".csv", ".tsv"} or "[" in row["source"][len(item.path):]
         if sequence and isinstance(epoch, (int, float)) and not isinstance(epoch, bool) and "best_epoch" not in fields and not any(key in fields for key in target_keys):
             histories[item.id].append(row)
+    # A final row is usable only from a complete, strictly increasing history.
+    last_histories = {item.id: histories[item.id] for item in members if histories.get(item.id)
+                      and item.metadata.get("_history_complete")
+                      and all(a["fields"]["epoch"] < b["fields"]["epoch"]
+                              for a, b in zip(histories[item.id], histories[item.id][1:]))}
+    resume_paths = {posixpath.normpath(ref.get("resolved_value", ref["value"]).replace("\\", "/"))
+                    for item in members for ref in item.metadata.get("references", [])
+                    if ref["kind"] == "derived_from" and "resume" in ref["field"].lower()}
+    resume_epochs = [(value, item.path) for item in members if not item.warnings
+                     for key, value in item.metadata.get("fields", {}).items()
+                     if key.rsplit(".", 1)[-1].lower() == "resume_epoch"]
+    resume_basis = ""
+    if (len(resume_paths) == 1 and resume_epochs and len(last_histories) == len(histories)
+            and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) and value >= 0 and value == int(value) for value, _ in resume_epochs)
+            and len({value for value, _ in resume_epochs}) == 1):
+        boundary = resume_epochs[0][0]
+        before = {key: rows for key, rows in last_histories.items() if rows[-1]["fields"]["epoch"] == boundary}
+        after = {key: rows for key, rows in last_histories.items() if rows[0]["fields"]["epoch"] == boundary + 1}
+        # Explicit resume evidence and adjacent, disjoint histories are required.
+        # Overlapping attempts (including reused directories) remain ambiguous.
+        if before and after and len(before) + len(after) == len(last_histories):
+            last_histories = after
+            sources = ", ".join(sorted({source for _, source in resume_epochs}))
+            resume_basis = f"Inferred from last filename and history after resume_epoch={int(boundary)} ({sources}); save not verified"
     for cp in checkpoints:
         if cp.metadata.get("metric_records"):
             continue  # Recorded paths / sidecars take precedence over broad conventions.
@@ -465,7 +501,7 @@ def checkpoint_metrics(members):
                 selected_epoch = int(match.group(1))
                 basis = "Inferred from epoch in filename; numbering not verified"
             elif stem in last_names and sum(PurePosixPath(other.path).stem.lower() in last_names for other in checkpoints) == 1:
-                basis = "Inferred from last filename and final recorded epoch; save not verified"
+                basis = resume_basis or "Inferred from last filename and final recorded epoch; save not verified"
                 confidence = .55
             else:
                 continue
@@ -474,15 +510,84 @@ def checkpoint_metrics(members):
             if not rows:
                 continue
             if selected_epoch is None:
-                epochs = [row["fields"]["epoch"] for row in rows]
-                # Partial or restarted logs cannot establish the final epoch.
-                if not item.metadata.get("_history_complete") or any(a >= b for a, b in zip(epochs, epochs[1:])):
+                if item.id not in last_histories:
                     continue
                 selected = [rows[-1]]
             else:
                 selected = [row for row in rows if row["fields"]["epoch"] == selected_epoch]
             if len(selected) == 1:
                 add(cp, selected[0], values(selected[0]["fields"]), confidence, basis)
+
+    for cp in checkpoints:
+        records = cp.metadata.get("metric_records", [])
+        fields = {key for record in records for key in record["values"]}
+        conflicts = []
+        for key in sorted(fields):
+            values_for_key = [record["values"][key] for record in records if key in record["values"]]
+            if any(not math.isclose(value, values_for_key[0], rel_tol=1e-6, abs_tol=1e-9) for value in values_for_key[1:]):
+                conflicts.append(key)
+        if conflicts:
+            cp.metadata["metric_conflicts"] = conflicts
+            note = "Metric records disagree on " + ", ".join(conflicts) + "; histories or evaluation settings may differ."
+            if note not in cp.warnings:
+                cp.warnings.append(note)
+            for record in records:
+                if record["basis"].startswith("Inferred"):
+                    record["confidence"] = min(record["confidence"], .4)
+
+
+def attach_tracking_records(experiments, artifacts, ownership):
+    """Attach W&B copies only with a unique checkpoint and compatible run facts."""
+    index = {item.id: item for item in artifacts}
+    paths = {item.path: item for item in artifacts if item.kind == "checkpoint"}
+    runs = {item.id: item for item in experiments}
+    removed = set()
+    for experiment in experiments:
+        folder = PurePosixPath(experiment.path)
+        if "wandb" not in folder.parts or folder.name != "files" or not folder.parent.name.startswith(("run-", "offline-run-")):
+            continue
+        experiment.name = folder.parent.name
+        members = [index[key] for key in experiment.artifacts]
+        if any(item.kind == "checkpoint" for item in members):
+            continue
+        declared = [ref for item in members if PurePosixPath(item.path).name == "wandb-summary.json"
+                    for ref in item.metadata.get("references", []) if ref.get("purpose") == "evaluation"]
+        targets = set()
+        for ref in declared:
+            value = ref["value"].replace("\\", "/")
+            bases = [PurePosixPath(ref["artifact"]).parent, *PurePosixPath(ref["artifact"]).parents]
+            matches = {paths[path].id for base in bases
+                       if (path := posixpath.normpath(str(base / value))) in paths}
+            if len(matches) != 1:
+                targets.clear()
+                break
+            targets.update(ownership[key] for key in matches)
+        if len(targets) != 1:
+            continue
+        target = runs[next(iter(targets))]
+        if target.id == experiment.id or "wandb" in PurePosixPath(target.path).parts or target.kind != "experiment":
+            continue
+        own = [index[key] for key in target.artifacts]
+        def facts(items):
+            configs = [item for item in items if item.kind == "config"]
+            result = defaultdict(set)
+            for item in configs or items:
+                for key, value in item.metadata.get("fields", {}).items():
+                    if isinstance(value, (str, int, float, bool)):
+                        kind = "number" if isinstance(value, (int, float)) and not isinstance(value, bool) else type(value).__name__
+                        result[key].add((kind, value))
+            return result
+        a, b = facts(own), facts(members)
+        common = a.keys() & b.keys()
+        if len(common) < 3 or any(len(a[key]) != 1 or a[key] != b[key] for key in common):
+            continue
+        for item in members:
+            ownership[item.id] = target.id
+            item.metadata["tracking_copy_of"] = target.path
+            target.artifacts.append(item.id)
+        target.evidence.append(f"Tracking records attached by checkpoint path and matching settings: {experiment.path}")
+        removed.add(experiment.id)
+    experiments[:] = [item for item in experiments if item.id not in removed]
 
 
 def identify(artifacts):
@@ -507,7 +612,7 @@ def identify(artifacts):
         # Config subfolders are supporting evidence, not independent runs.
         if PurePosixPath(directory).name in {"configs", ".hydra"}:
             continue
-        if (config and ("checkpoint" in kinds or child_checkpoint or ((training or references) and metrics))) or (state and metrics) or ("checkpoint" in kinds and metrics):
+        if (config and ("checkpoint" in kinds or child_checkpoint or ((training or references) and metrics))) or (state and metrics) or (("checkpoint" in kinds or child_checkpoint) and metrics):
             evidence = []
             if config:
                 evidence.append("Configuration and run artifacts colocated.")
@@ -529,6 +634,20 @@ def identify(artifacts):
         nearby = list(by_dir.get(parent, []))
         for folder in ARTIFACT_FOLDERS | {"logs"}:
             nearby.extend(by_dir.get(str(PurePosixPath(parent) / folder), []))
+        checkpoints = [item for item in nearby if item.kind == "checkpoint"]
+        run_records = any(item.kind in {"log", "metrics"} or item.metadata.get("times")
+                          or item.metadata.get("references") for item in nearby + items)
+        if PurePosixPath(directory).name == "configs" and checkpoints and not run_records:
+            child_hashes = {item.sha256 for child in anchors if PurePosixPath(parent) in PurePosixPath(child).parents
+                            for folder in {".", *ARTIFACT_FOLDERS}
+                            for item in by_dir.get(str(PurePosixPath(child) / folder), [])
+                            if item.kind == "checkpoint" and item.size > 0 and item.sha256}
+            if all(item.size > 0 and item.sha256 in child_hashes for item in checkpoints):
+                # Shared project settings plus files also present in child runs do
+                # not establish another training run or the copies' configuration.
+                for item in checkpoints:
+                    item.warnings.append(f"Config in {directory} was not bound: identical checkpoint bytes exist in a child run, but no local training record ties this file to that config.")
+                continue
         if any(item.kind in {"checkpoint", "log", "metrics"} for item in nearby):
             anchors[parent] = Experiment(stable_id("exp", parent), PurePosixPath(parent).name or ".", parent, .8, ["Training config in a supporting folder and run artifacts in its parent."])
 
@@ -556,6 +675,7 @@ def identify(artifacts):
             owner.artifacts.append(item.id)
             ownership[item.id] = owner.id
 
+    attach_tracking_records(experiments, artifacts, ownership)
     index = {item.id: item for item in artifacts}
     for experiment in experiments:
         members = [index[key] for key in experiment.artifacts]
@@ -651,6 +771,9 @@ def identify(artifacts):
     for folder in folders:
         checkpoint_metrics([item for item in by_dir[folder] if item.id not in ownership or ownership[item.id] in candidates])
     for item in artifacts:
+        if item.metadata.get("metric_conflicts") and item.id in ownership:
+            owner = next(exp for exp in experiments if exp.id == ownership[item.id])
+            owner.warnings.extend(f"{item.path}: {note}" for note in item.warnings if "Metric records disagree" in note)
         item.metadata.pop("_metric_rows", None)
         item.metadata.pop("_history_complete", None)
     return sorted(experiments, key=lambda item: item.path), ownership

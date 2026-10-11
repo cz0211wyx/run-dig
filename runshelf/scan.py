@@ -3,17 +3,20 @@
 import fnmatch
 import hashlib
 import os
+import re
 import stat
+import zipfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .metadata import extract, identify
+from .metadata import ARTIFACT_FOLDERS, extract, identify
 from .lineage import infer
 from .models import Artifact, Report, stable_id
 
-CHECKPOINT_EXTENSIONS = {".pt", ".pth", ".ckpt", ".safetensors"}
+CHECKPOINT_EXTENSIONS = {".pt", ".pth", ".ckpt", ".safetensors", ".npz"}
+NPZ_INSPECTION_LIMIT = 64_000_000
 DEFAULT_EXCLUDES = {".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
                     "__pycache__", ".mypy_cache", ".pytest_cache", ".work", "site-packages"}
 SCRIPT_EXTENSIONS = {".py", ".sh", ".bash", ".ps1", ".bat", ".ipynb"}
@@ -43,6 +46,39 @@ def classify(path: Path) -> str | None:
     if suffix == ".log" or stem in {"train", "training", "stdout", "stderr"}:
         return "log"
     return "metadata"
+
+
+def npz_checkpoint(path):
+    """Inspect ZIP entry names only; never deserialize arrays or pickle objects."""
+    hint = bool(re.match(r"(model|weights?|params?|checkpoint|ckpt|best|last|final|epoch|step)($|[_\W]|\d)",
+                          path.stem, re.I)) or path.parent.name.lower() in ARTIFACT_FOLDERS
+    # Bound ZIP directory parsing even for archives with millions of entries.
+    if path.stat().st_size > NPZ_INSPECTION_LIMIT:
+        return hint, ["NPZ inspection skipped above 64 MB; model status is inferred from its filename or folder only."]
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = {entry.filename[:-4].lower() for entry in archive.infolist()
+                     if entry.filename.lower().endswith(".npy") and not entry.is_dir()}
+    except (zipfile.BadZipFile, ValueError) as error:
+        return hint, [f"Cannot read NPZ archive ({type(error).__name__}); checkpoint contents are unverified."]
+    if not names:
+        return hint, ["NPZ archive has no array entries; checkpoint contents are unverified."]
+    parameters = {name for name in names if re.search(
+        r"(^|[./_])((weight|bias|kernel|embedding|param(?:eter)?)s?($|[./_\d])|[wb]\d*$)", name)}
+    state = any(re.search(r"(^|[./_])(epoch|global_step|optimizer|velocity|momentum)($|[./_])", name)
+                for name in names)
+    if len(parameters) >= 2 or (parameters and state):
+        return True, []
+    # A feature/data cache must not become a checkpoint just because it is NPZ.
+    if names & {"features", "ids", "labels", "targets", "samples", "x_train", "y_train"}:
+        return False, []
+    if parameters and hint:
+        return True, []
+    # Unnamed NumPy arrays can be a model when the save location says so. Named
+    # non-parameter arrays (predictions, explanations, etc.) are not weights.
+    guessed = hint and all(re.fullmatch(r"arr_\d+", name) for name in names)
+    return guessed, (["NPZ checkpoint inferred from its filename or folder; array names do not establish model parameters."]
+                     if guessed else [])
 
 
 def inventory(root: Path, *, excludes=(), output: Path | None = None, text_limit=2_000_000,
@@ -94,6 +130,12 @@ def inventory(root: Path, *, excludes=(), output: Path | None = None, text_limit
                     continue
                 relative = path.relative_to(root).as_posix()
                 item = Artifact(stable_id("file", relative), relative, kind, info.st_size, info.st_mtime)
+                if path.suffix.lower() == ".npz":
+                    recognized, notes = npz_checkpoint(path)
+                    if not recognized:
+                        warnings.extend({"kind": "identification", "path": relative, "message": note} for note in notes)
+                        continue
+                    item.warnings.extend(notes)
                 should_hash = kind in {"script", "config"} and info.st_size <= text_limit
                 if kind == "checkpoint":
                     should_hash = info.st_size <= hash_limit and stats["hashed_checkpoint_bytes"] + info.st_size <= hash_budget and hash_limit > 0
@@ -139,6 +181,9 @@ def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=
         extract(root, item, text_limit)
         warnings.extend({"kind": "extraction", "path": item.path, "message": warning} for warning in item.warnings)
     experiments, ownership = identify(artifacts)
+    for experiment in experiments:
+        if experiment.path == ".":
+            experiment.name = root.name
     edges, inference_warnings = infer(experiments, artifacts, ownership, similarity_threshold=similarity_threshold,
                                        max_pairs=max_pairs)
     warnings.extend(inference_warnings)

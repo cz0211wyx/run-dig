@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__
-from .scan import CHECKPOINT_EXTENSIONS, analyze
+from .scan import CHECKPOINT_EXTENSIONS, analyze, is_link, npz_checkpoint
 from .metadata import ARTIFACT_FOLDERS
 from .report import validate_output, write_report
 
@@ -34,15 +34,30 @@ def list_checkpoints(args):
         print(f"Cannot read: {error}", file=sys.stderr)
 
     for folder, directories, filenames in os.walk(root, onerror=report_error):
-        directories.sort()
+        kept = []
+        for name in sorted(directories):
+            try:
+                if not is_link(Path(folder) / name):
+                    kept.append(name)
+            except OSError as error:
+                report_error(error)
+        directories[:] = kept
         for filename in sorted(filenames):
             path = Path(folder) / filename
-            if path.suffix.lower() not in {".pt", ".pth", ".ckpt"}:
+            if path.suffix.lower() not in CHECKPOINT_EXTENSIONS:
                 continue
             if args.name.casefold() not in filename.casefold():
                 continue
             try:
+                if is_link(path) or not path.is_file():
+                    continue
                 info = path.stat()
+                if path.suffix.lower() == ".npz":
+                    recognized, notes = npz_checkpoint(path)
+                    for note in notes:
+                        print(f"Note: {path}: {note}", file=sys.stderr)
+                    if not recognized:
+                        continue
             except OSError as error:
                 report_error(error)
                 continue
@@ -92,7 +107,7 @@ def load_checkpoints(paths, root=None):
     for checkpoint in checkpoints:
         artifact = artifacts.get(checkpoint.relative_to(root).as_posix())
         if artifact is None:
-            raise ValueError("Checkpoint was excluded or unreadable; it was not analyzed.")
+            raise ValueError("File was excluded, unreadable, or not recognized as a model checkpoint.")
         result.append((checkpoint, artifact, owners[artifact.id]))
     return report, result
 
@@ -128,6 +143,8 @@ def inspect_checkpoint(args):
     if experiment.roles:
         print("Role: " + ", ".join(f"{key}={value}" for key, value in experiment.roles.items()))
     print(f"Scan root: {report.root}")
+    for warning in artifact.warnings:
+        print(f"Note: {warning}")
     if args.root is None:
         print("Use --root DIRECTORY to include sources and experiments outside this folder.")
     if experiment.kind == "checkpoint_candidate":
@@ -142,6 +159,8 @@ def inspect_checkpoint(args):
         for edge in related:
             other = by_id[edge.source if side == "target" else edge.target]
             print(f"  {other.path} ({descriptions[edge.kind]}, confidence {edge.confidence:.0%})")
+            if edge.description:
+                print(f"    {edge.description}")
             for fact in edge.evidence:
                 if fact.get("artifact"):
                     detail = f"component: {fact['component']}" if fact.get('component') else fact.get('field', '')
@@ -163,7 +182,13 @@ def inspect_checkpoint(args):
         core = {"model", "model_type", "architecture", "seed", "lr", "learning_rate", "batch_size", "epochs"}
         keys = sorted(visible, key=lambda key: (not (key.rsplit('.', 1)[-1] in core if heading == "Run configuration" else 'best_' in key), key))
         for key in keys if args.full else keys[:8]:
-            print(f"  {key}: {display_value(visible[key])}")
+            sources = experiment.config_sources.get(key, []) if heading == "Run configuration" else []
+            if any(source["value"] != visible[key] for source in sources):
+                print(f"  {key}: Conflicting values")
+                for source in sources:
+                    print(f"    {display_value(source['value'])} | {source['artifact']}")
+            else:
+                print(f"  {key}: {display_value(visible[key])}")
         if not args.full and len(keys) > 8:
             print(f"  ... {len(keys) - 8} more fields; use --full to show all.")
     if report.statistics["warnings"]:

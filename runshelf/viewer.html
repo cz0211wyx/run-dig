@@ -8,6 +8,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; color: #24292f; background: #fff; font: 14px/1.6 system-ui, sans-serif; }
 main { max-width: 1080px; margin: 0 auto; padding: 32px 28px; }
+main:has(#graph-view:not([hidden])) { max-width: 1480px; }
 header { border-bottom: 1px solid #e5e7eb; padding-bottom: 18px; margin-bottom: 28px; }
 h1 { font-size: 22px; margin: 0 0 6px; }
 h2 { font-size: 19px; margin: 0 0 6px; overflow-wrap: anywhere; }
@@ -56,15 +57,21 @@ summary { cursor: pointer; }
 .graph-viewport { overflow: auto; max-height: 620px; border: 1px solid #e5e7eb; background: #fafbfc; }
 .graph-viewport svg { display: block; }
 .graph-node { cursor: pointer; }
-.graph-edge { opacity: .32; stroke-dasharray: 4 5; transition: opacity .12s; }
-.graph-edge.secondary { opacity: .16; }
-.graph-edge.highlighted, .graph-edge:hover { opacity: 1; stroke-dasharray: none; stroke-width: 2.5; }
-.graph-edge.dimmed { opacity: .04; }
-.graph-node.dimmed { opacity: .3; }
-.graph-node:focus rect { stroke: #245f9b; stroke-width: 2; }
+.graph-edge { opacity: var(--source-opacity, .65); stroke-dasharray: 4 5; stroke-linecap: round; stroke-linejoin: round; transition: opacity .12s; }
+.graph-edge.secondary { opacity: 0; pointer-events: none; }
+.show-similar .graph-edge.secondary { opacity: var(--similarity-opacity, .12); pointer-events: stroke; }
+.graph-edge.highlighted, .graph-edge.secondary.highlighted, .graph-edge:hover { opacity: 1; stroke-dasharray: none; stroke-width: 2.5; pointer-events: stroke; }
+.graph-edge.secondary.highlighted { stroke-dasharray: 4 5; stroke-width: 1.6; }
+.graph-edge.dimmed { opacity: .04; pointer-events: none; }
+.graph-edge.secondary.dimmed { opacity: 0; pointer-events: none; }
+.graph-node.dimmed text { opacity: .4; }
+.graph-node.dimmed rect { stroke: #e5e7eb; }
+.graph-node:hover rect, .graph-node:focus rect { fill: #edf4fb; stroke: #245f9b; stroke-width: 2; }
 .graph-match rect { fill: #fff4cb; stroke: #ad7c08; }
 .origin { margin: 18px 0; }
 .notice { color: #87631d; }
+.field-conflict { background: #fff9ec; }
+.file-note { margin-top: 6px; font-size: 12px; overflow-wrap: anywhere; }
 footer { border-top: 1px solid #e5e7eb; margin-top: 32px; padding-top: 12px; font-size: 12px; color: #687079; }
 footer a { color: #245f9b; }
 #scan-notes { max-height: 320px; overflow: auto; }
@@ -106,7 +113,7 @@ footer a { color: #245f9b; }
     </div>
     <p id="empty" class="empty" hidden>No matching experiments.</p>
     <div id="graph-view" hidden>
-      <label><input id="include-similar" type="checkbox" checked> Include similarity and identical files</label>
+      <label><input id="include-similar" type="checkbox" checked> Show all similarity / identical-file links</label>
       <p id="graph-count" class="muted"></p>
       <div id="global-graph"></div>
     </div>
@@ -153,6 +160,7 @@ function modified(timestamp) {
 }
 
 function describe(edge, selected) {
+  if (edge.description === 'Conflicting source records') return edge.description;
   const incoming = edge.target === selected;
   if (edge.kind === 'derived_from') return incoming ? 'Continues from' : 'Continued by';
   if (edge.kind === 'references') return incoming ? 'Uses a checkpoint from' : 'Checkpoint used by';
@@ -185,6 +193,10 @@ function renderList() {
   for (const node of $('global-graph').querySelectorAll('.graph-node')) {
     node.classList.toggle('graph-match', Boolean(query) && matches.has(node.dataset.id));
   }
+  if (overviewView === 'graph' && query && matching.length === 1) {
+    const node = $('global-graph').querySelector(`[data-id="${matching[0].id}"]`);
+    if (node) node.scrollIntoView({block: 'nearest', inline: 'center'});
+  }
 }
 
 function fold(parent, title, render) {
@@ -209,6 +221,7 @@ function fileTable(parent, members) {
   for (const file of members) {
     const row = element('tr'), name = element('td');
     name.append(element('div', file.path.split('/').pop()), element('div', file.path, 'path'));
+    for (const warning of file.warnings || []) name.append(element('div', warning, 'notice file-note'));
     const records = file.metadata?.metric_records || [];
     if (records.length) {
       const details = fold(name, 'Checkpoint metrics', parent => {
@@ -233,15 +246,25 @@ function valueTable(parent, values, sources) {
   const thead = element('thead'); thead.append(head); table.append(thead);
   const body = element('tbody');
   for (const [key, value] of Object.entries(values)) {
-    const row = element('tr'), path = element('td', undefined, 'path');
     const source = sources[key];
     const prefix = typeof source === 'string' ? source.split('/').pop() + ':' : '';
     const name = prefix && key.startsWith(prefix) ? key.slice(prefix.length) : key;
-    const paths = Array.isArray(source) ? [...new Set(source.map(item => item.artifact))] : source ? [source] : ['—'];
-    for (const file of paths) path.append(element('div', file));
-    if (Array.isArray(source) && source.some(item => item.inherited)) path.append(element('div', 'Shared parent config (inferred)', 'muted'));
-    row.append(element('td', name), element('td', typeof value === 'object' ? JSON.stringify(value) : String(value)), path);
-    body.append(row);
+    const variants = new Map();
+    for (const entry of Array.isArray(source) && source.length ? source : [{value, artifact: source || '—'}]) {
+      const signature = JSON.stringify(entry.value);
+      if (!variants.has(signature)) variants.set(signature, {value: entry.value, paths: new Set(), inherited: false});
+      const variant = variants.get(signature); variant.paths.add(entry.artifact); variant.inherited ||= Boolean(entry.inherited);
+    }
+    for (const variant of variants.values()) {
+      const row = element('tr', undefined, variants.size > 1 ? 'field-conflict' : undefined), path = element('td', undefined, 'path');
+      row.dataset.field = key;
+      for (const file of variant.paths) path.append(element('div', file));
+      if (variant.inherited) path.append(element('div', 'Shared parent config (inferred)', 'muted'));
+      const label = element('td', name);
+      if (variants.size > 1) label.append(element('div', 'Conflicting values', 'notice'));
+      row.append(label, element('td', typeof variant.value === 'object' ? JSON.stringify(variant.value) : String(variant.value)), path);
+      body.append(row);
+    }
   }
   table.append(body); wrap.append(table); parent.append(wrap);
 }
@@ -328,6 +351,7 @@ function showExperiment(id) {
   }
   if (Object.keys(item.roles || {}).length && !collection) heading.append(element('p', Object.entries(item.roles).map(([key, value]) => `${key}: ${value}`).join(' · '), 'muted'));
   if (item.kind === 'checkpoint_candidate') heading.append(element('p', 'This checkpoint could not be linked to a specific run.', 'notice'));
+  if (item.warnings.some(note => /conflict|disagree/i.test(note))) heading.append(element('p', 'Some records disagree. Conflicting values and sources are highlighted below.', 'notice'));
   panel.append(heading);
   if (collection) {
     const children = element('section'); children.id = 'collection-members';
@@ -346,6 +370,7 @@ function showExperiment(id) {
   const downstream = related.filter(edge => edge.directed && edge.source === id);
   const origin = element('section', undefined, 'origin'); origin.id = 'origin';
   origin.append(element('h3', 'Sources'));
+  if (item.references.some(ref => ref.conflict)) origin.append(element('p', 'Source records disagree; origin is uncertain. Both accounts are shown below.', 'notice'));
   if (collection || !sources.some(edge => edge.kind === 'derived_from')) {
     origin.append(element('p', collection ? "Shared sources; check each sub-experiment's own evidence." : sources.length ? 'No recorded continuation found. Checkpoint use and possible sources are listed below.' : 'Origin unknown: no source link found. Similarity alone cannot establish where this experiment came from.', 'muted'));
   }
@@ -398,11 +423,12 @@ function showExperiment(id) {
   $('back').focus({preventScroll: true});
 }
 
-function layoutGraph(nodes, edges) {
+function layoutGraph(nodes, edges, availableWidth, selectedId) {
   const adjacency = new Map(nodes.map(item => [item.id, []]));
   for (const edge of edges) {
-    adjacency.get(edge.source).push(edge.target);
-    adjacency.get(edge.target).push(edge.source);
+    const weight = edge.directed ? 3 : edge.kind === 'same_artifact' ? 2 : edge.confidence;
+    adjacency.get(edge.source).push({id: edge.target, weight});
+    adjacency.get(edge.target).push({id: edge.source, weight});
   }
   const components = [], seen = new Set();
   for (const node of nodes) {
@@ -410,83 +436,228 @@ function layoutGraph(nodes, edges) {
     const ids = [], pending = [node.id]; seen.add(node.id);
     while (pending.length) {
       const id = pending.pop(); ids.push(id);
-      for (const next of adjacency.get(id)) {
-        if (!seen.has(next)) { seen.add(next); pending.push(next); }
-      }
+      for (const next of adjacency.get(id)) if (!seen.has(next.id)) { seen.add(next.id); pending.push(next.id); }
     }
     components.push(ids);
   }
-  components.sort((a, b) => b.length - a.length);
+  components.sort((a, b) => Number(b.includes(selectedId)) - Number(a.includes(selectedId)) || b.length - a.length);
   const boxes = components.map(ids => {
-    const members = new Set(ids), ranks = new Map(ids.map(id => [id, 0]));
-    const directed = edges.filter(edge => edge.directed && members.has(edge.source));
-    if (directed.length) {
-      const incoming = new Map(ids.map(id => [id, 0]));
-      const outgoing = new Map(ids.map(id => [id, []]));
-      for (const edge of directed) {
-        incoming.set(edge.target, incoming.get(edge.target) + 1);
-        outgoing.get(edge.source).push(edge.target);
-      }
-      const queue = ids.filter(id => incoming.get(id) === 0);
-      for (let i = 0; i < queue.length; i++) {
-        const id = queue[i];
-        for (const target of outgoing.get(id)) {
-          ranks.set(target, Math.max(ranks.get(target), ranks.get(id) + 1));
-          incoming.set(target, incoming.get(target) - 1);
-          if (!incoming.get(target)) queue.push(target);
-        }
-      }
-      // Cycles remain visible in the first column; never fabricate a time order.
-      for (const id of ids) if (incoming.get(id)) ranks.set(id, 0);
-    } else {
-      const queue = [ids[0]], visited = new Set(queue);
-      for (let i = 0; i < queue.length; i++) for (const next of adjacency.get(queue[i])) {
-        if (!visited.has(next)) { visited.add(next); ranks.set(next, ranks.get(queue[i]) + 1); queue.push(next); }
-      }
-    }
-    const columns = new Map(), points = new Map();
     ids.sort((a, b) => byId.get(a).path.localeCompare(byId.get(b).path));
-    for (const id of ids) {
-      const rank = ranks.get(id);
-      if (!columns.has(rank)) columns.set(rank, []);
-      columns.get(rank).push(id);
+    const members = new Set(ids), parents = new Map(ids.map(id => [id, []])), children = new Map(ids.map(id => [id, []]));
+    for (const edge of edges.filter(edge => edge.directed && members.has(edge.source))) {
+      parents.get(edge.target).push(edge.source); children.get(edge.source).push(edge.target);
     }
-    // Order each column by its neighbors instead of by name, reducing crossings.
-    const levels = [...columns.keys()].sort((a, b) => a - b);
-    for (let sweep = 0; sweep < 6; sweep++) {
-      const order = new Map();
-      for (const column of columns.values()) column.forEach((id, i) => order.set(id, (i + .5) / column.length));
-      for (const level of sweep % 2 ? [...levels].reverse() : levels) {
+    const incoming = new Map(ids.map(id => [id, parents.get(id).length])), depth = new Map(ids.map(id => [id, 0]));
+    const order = ids.filter(id => !incoming.get(id));
+    for (let i = 0; i < order.length; i++) for (const child of children.get(order[i])) {
+      depth.set(child, Math.max(depth.get(child), depth.get(order[i]) + 1));
+      incoming.set(child, incoming.get(child) - 1);
+      if (!incoming.get(child)) order.push(child);
+    }
+    const acyclic = order.length === ids.length, remaining = new Map(ids.map(id => [id, 0]));
+    if (acyclic) for (const id of [...order].reverse()) for (const child of children.get(id)) remaining.set(id, Math.max(remaining.get(id), remaining.get(child) + 1));
+    else { order.splice(0, order.length, ...ids); for (const id of ids) depth.set(id, 0); }
+    // Reserve room for source chains, then fill their gaps with the other experiments.
+    const constrained = id => parents.get(id).length || children.get(id).length;
+    const placement = [...order.filter(constrained), ...order.filter(id => !constrained(id))];
+    const count = Math.max(...depth.values()) + 1;
+    const columns = Array.from({length: Math.max(count, Math.min(Math.ceil(Math.sqrt(ids.length)), Math.max(1, Math.floor((availableWidth - 40) / 264))))}, () => []);
+    const ranks = new Map();
+    // All relationships influence proximity. Only recorded direction constrains columns.
+    for (const id of placement) {
+      const lower = acyclic ? Math.max(0, ...parents.get(id).map(parent => ranks.get(parent) + 1)) : 0;
+      const upper = columns.length - 1 - remaining.get(id);
+      const neighbors = adjacency.get(id).filter(next => ranks.has(next.id));
+      const weight = neighbors.reduce((sum, next) => sum + next.weight, 0);
+      let best = lower, score = Infinity;
+      for (let column = lower; column <= upper; column++) {
+        const distance = neighbors.reduce((sum, next) => sum + next.weight * Math.abs(column - ranks.get(next.id)), 0) / (weight || 1);
+        const candidate = columns[column].length * 1.5 + distance;
+        if (candidate < score) { score = candidate; best = column; }
+      }
+      ranks.set(id, best); columns[best].push(id);
+    }
+    for (let sweep = 0; sweep < 8; sweep++) {
+      const positions = new Map();
+      columns.forEach(column => column.forEach((id, i) => positions.set(id, i - (column.length - 1) / 2)));
+      for (const column of sweep % 2 ? [...columns].reverse() : columns) {
         const score = id => {
-          const neighbors = adjacency.get(id).filter(next => sweep % 2 ? ranks.get(next) > level : ranks.get(next) < level);
-          return neighbors.length ? neighbors.reduce((sum, next) => sum + order.get(next), 0) / neighbors.length : order.get(id);
+          const neighbors = adjacency.get(id).filter(next => ranks.get(next.id) !== ranks.get(id));
+          const weight = neighbors.reduce((sum, next) => sum + next.weight, 0);
+          return weight ? neighbors.reduce((sum, next) => sum + next.weight * positions.get(next.id), 0) / weight : positions.get(id);
         };
-        columns.get(level).sort((a, b) => score(a) - score(b));
-        columns.get(level).forEach((id, i, column) => order.set(id, (i + .5) / column.length));
+        column.sort((a, b) => score(a) - score(b));
+        column.forEach((id, i) => positions.set(id, i - (column.length - 1) / 2));
       }
     }
-    const routed = directed.filter(edge => ranks.get(edge.target) - ranks.get(edge.source) !== 1);
-    const top = routed.length * 12 + 12;
-    for (const rank of levels) {
-      let previous = top - 100;
-      columns.get(rank).forEach((id, i) => {
-        const parents = adjacency.get(id).filter(next => ranks.get(next) < rank && points.has(next));
-        const desired = parents.length ? parents.reduce((sum, next) => sum + points.get(next).y, 0) / parents.length : top + i * 100;
-        const y = Math.max(previous + 100, desired); previous = y;
-        points.set(id, {x: rank * 360, y});
-      });
-    }
-    return {points, routed, width: Math.max(...ranks.values()) * 360 + 260, height: Math.max(...[...points.values()].map(point => point.y)) + 100};
+    const rows = Math.max(...columns.map(column => column.length)), points = new Map();
+    columns.forEach((column, rank) => column.forEach((id, i) => points.set(id, {x: rank * 300, y: i * 132})));
+    return {points, width: (columns.length - 1) * 300 + 220, height: (rows - 1) * 132 + 64};
   });
-  const width = Math.max(1060, ...boxes.map(box => box.width + 40));
-  const points = new Map(), lanes = new Map(); let x = 20, y = 20, rowHeight = 0;
+  const width = Math.max(1000, availableWidth - 2, ...boxes.map(box => box.width + 48)), points = new Map();
+  let x = 24, y = 24, rowHeight = 0;
   for (const box of boxes) {
-    if (x + box.width > width - 20) { x = 20; y += rowHeight + 36; rowHeight = 0; }
+    if (x + box.width > width - 24) { x = 24; y += rowHeight + 64; rowHeight = 0; }
     for (const [id, point] of box.points) points.set(id, {x: x + point.x, y: y + point.y});
-    box.routed.forEach((edge, i) => lanes.set(edge.id, y + 6 + i * 12));
-    x += box.width + 40; rowHeight = Math.max(rowHeight, box.height);
+    x += box.width + 64; rowHeight = Math.max(rowHeight, box.height);
   }
-  return {points, lanes, width, height: Math.max(100, y + rowHeight + 20)};
+  return {points, width, height: y + rowHeight + 24};
+}
+
+function graphRouter(points, width, height) {
+  // The grid is only a guide when a direct curve would cross a card.
+  const boxes = [...points.values()].map(p => ({x: p.x, y: p.y, width: 220, height: 64}));
+  const obstacles = boxes.map(b => ({left: b.x - 8, right: b.x + b.width + 8, top: b.y - 8, bottom: b.y + b.height + 8}));
+  function coordinates(axis, extent, limit) {
+    const values = [...new Set([4, limit - 4, ...boxes.flatMap(b => [b[axis] - 20, b[axis] + b[extent] + 20])])].sort((a, b) => a - b);
+    return [...values, ...values.slice(1).flatMap((v, i) => v - values[i] >= 24 ? [(v + values[i]) / 2] : [])].sort((a, b) => a - b);
+  }
+  const xs = coordinates('x', 'width', width), ys = coordinates('y', 'height', height), columns = xs.length;
+  const point = index => ({x: xs[index % columns], y: ys[Math.floor(index / columns)]});
+  const clear = (a, b) => !obstacles.some(o => a.x === b.x
+    ? a.x > o.left && a.x < o.right && Math.max(a.y, b.y) > o.top && Math.min(a.y, b.y) < o.bottom
+    : a.y > o.top && a.y < o.bottom && Math.max(a.x, b.x) > o.left && Math.min(a.x, b.x) < o.right);
+  const neighbors = new Map(), traffic = new Map();
+  const segmentKey = (a, b) => `${Math.min(a, b)}:${Math.max(a, b)}`;
+  function adjacent(index) {
+    if (!neighbors.has(index)) {
+      const x = index % columns, y = Math.floor(index / columns), a = point(index);
+      const candidates = [x > 0 ? index - 1 : -1, x + 1 < columns ? index + 1 : -1, y > 0 ? index - columns : -1, y + 1 < ys.length ? index + columns : -1];
+      neighbors.set(index, candidates.filter(next => next >= 0 && clear(a, point(next))));
+    }
+    return neighbors.get(index);
+  }
+  function attachments(p) {
+    const x = xs.indexOf(p.x), below = ys.findIndex(y => y >= p.y);
+    return [...new Set([below - 1, below])].filter(y => y >= 0 && y < ys.length)
+      .map(y => y * columns + x).filter(index => clear(p, point(index)));
+  }
+  return (a, b, recorded, lane) => {
+    const distance = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
+    const middle = (p, q) => ({x: (p.x + q.x) / 2, y: (p.y + q.y) / 2});
+    const barriers = boxes.map(box => {
+      const endpoint = [a, b].some(p => p.y >= box.y && p.y <= box.y + box.height && (p.x === box.x || p.x === box.x + box.width));
+      const margin = endpoint ? 0 : 3;
+      return {left: box.x - margin, right: box.x + box.width + margin, top: box.y - margin, bottom: box.y + box.height + margin};
+    });
+    // Subdivide Beziers against card rectangles; their control-point hull bounds each piece.
+    function curveClear(curve, candidates = barriers, depth = 0) {
+      const left = Math.min(...curve.map(p => p.x)), right = Math.max(...curve.map(p => p.x));
+      const top = Math.min(...curve.map(p => p.y)), bottom = Math.max(...curve.map(p => p.y));
+      const hits = candidates.filter(o => right > o.left + .001 && left < o.right - .001 && bottom > o.top + .001 && top < o.bottom - .001);
+      if (!hits.length) return true;
+      if (depth === 10) return false;
+      const [p, c, d, q] = curve, pc = middle(p, c), cd = middle(c, d), dq = middle(d, q);
+      const first = middle(pc, cd), second = middle(cd, dq), center = middle(first, second);
+      return curveClear([p, pc, first, center], hits, depth + 1) && curveClear([center, second, dq, q], hits, depth + 1);
+    }
+    const encode = curves => `M${a.x},${a.y}` + curves.map(([, c, d, q]) => ` C${c.x},${c.y} ${d.x},${d.y} ${q.x},${q.y}`).join('');
+    function gentle([p, c, d, q]) {
+      // A long, narrow S-curve can be collision-free but still hook sharply at its ends.
+      for (let step = 0; step <= 20; step++) {
+        const t = step / 20, u = 1 - t;
+        const dx = 3 * (u * u * (c.x - p.x) + 2 * u * t * (d.x - c.x) + t * t * (q.x - d.x));
+        const dy = 3 * (u * u * (c.y - p.y) + 2 * u * t * (d.y - c.y) + t * t * (q.y - d.y));
+        const ddx = 6 * (u * (d.x - 2 * c.x + p.x) + t * (q.x - 2 * d.x + c.x));
+        const ddy = 6 * (u * (d.y - 2 * c.y + p.y) + t * (q.y - 2 * d.y + c.y));
+        const speed = Math.hypot(dx, dy);
+        if (speed > .001 && Math.abs(dx * ddy - dy * ddx) / speed ** 3 > 1 / 10) return false;
+      }
+      return true;
+    }
+    const bend = a.x === b.x ? 64 + lane : Math.max(24, Math.min(160, Math.abs(b.x - a.x) * .5) + lane);
+    const direct = [a, {x: a.x + a.sign * bend, y: a.y}, {x: b.x + b.sign * bend, y: b.y}, b];
+    if (curveClear(direct) && gentle(direct)) return encode([direct]);
+    const start = {x: a.x + a.sign * 20, y: a.y}, end = {x: b.x + b.sign * 20, y: b.y};
+    const goals = new Set(attachments(end)), costs = new Map(), previous = new Map(), heap = [];
+    function push(state, cost) {
+      const item = {state, cost, score: cost + distance(point(Math.floor(state / 2)), end)};
+      let i = heap.length; heap.push(item);
+      while (i > 0) { const p = (i - 1) >> 1; if (heap[p].score <= item.score) break; heap[i] = heap[p]; i = p; }
+      heap[i] = item;
+    }
+    function pop() {
+      const first = heap[0], last = heap.pop();
+      if (heap.length) {
+        let i = 0;
+        while (i * 2 + 1 < heap.length) {
+          let child = i * 2 + 1;
+          if (child + 1 < heap.length && heap[child + 1].score < heap[child].score) child++;
+          if (heap[child].score >= last.score) break;
+          heap[i] = heap[child]; i = child;
+        }
+        heap[i] = last;
+      }
+      return first;
+    }
+    for (const index of attachments(start)) {
+      const cost = distance(start, point(index)), state = index * 2 + 1;
+      costs.set(state, cost); push(state, cost);
+    }
+    let found;
+    while (heap.length) {
+      const {state, cost} = pop();
+      if (cost !== costs.get(state)) continue;
+      const index = Math.floor(state / 2), p = point(index);
+      if (goals.has(index)) { found = state; break; }
+      for (const next of adjacent(index)) {
+        const q = point(next), direction = p.x === q.x ? 1 : 0, nextState = next * 2 + direction;
+        const penalty = recorded ? (traffic.get(segmentKey(index, next)) || 0) * 6 : 0;
+        const total = cost + distance(p, q) + (direction === state % 2 ? 0 : 18) + penalty;
+        if (total >= (costs.get(nextState) ?? Infinity)) continue;
+        costs.set(nextState, total); previous.set(nextState, state); push(nextState, total);
+      }
+    }
+    // Never fall back to a straight line through a card if a malformed layout blocks a path.
+    if (found === undefined) return '';
+    const indices = [];
+    for (let state = found; state !== undefined; state = previous.get(state)) indices.push(Math.floor(state / 2));
+    indices.reverse();
+    if (recorded) for (let i = 1; i < indices.length; i++) {
+      const key = segmentKey(indices[i - 1], indices[i]); traffic.set(key, (traffic.get(key) || 0) + 1);
+    }
+    // Round before and after each bend, instead of forcing a spline through the corner.
+    const shifted = indices.map(index => {
+      const p = point(index);
+      return {x: Math.max(4, Math.min(width - 4, p.x + lane)), y: Math.max(4, Math.min(height - 4, p.y + lane))};
+    });
+    const guides = [a, {x: shifted[0].x, y: a.y}, ...shifted, {x: shifted.at(-1).x, y: b.y}, b];
+    const route = [];
+    for (const p of guides) {
+      if (route.length && distance(route.at(-1), p) < .01) continue;
+      while (route.length > 1) {
+        const q = route.at(-1), r = route.at(-2);
+        if (!((r.x === q.x && q.x === p.x) || (r.y === q.y && q.y === p.y))) break;
+        route.pop();
+      }
+      route.push(p);
+    }
+    const curves = [];
+    let cursor = a;
+    function straight(q) {
+      if (distance(cursor, q) > .01) curves.push([cursor, middle(cursor, q), middle(cursor, q), q]);
+      cursor = q;
+    }
+    for (let i = 1; i < route.length - 1; i++) {
+      const p = route[i], before = route[i - 1], after = route[i + 1];
+      const incoming = distance(p, before), outgoing = distance(p, after);
+      let radius = Math.min(72, incoming / (i === 1 ? 1 : 2), outgoing / (i === route.length - 2 ? 1 : 2)), turn;
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const entry = {x: p.x + (before.x - p.x) * radius / incoming, y: p.y + (before.y - p.y) * radius / incoming};
+        const exit = {x: p.x + (after.x - p.x) * radius / outgoing, y: p.y + (after.y - p.y) * radius / outgoing};
+        // A cubic circular arc keeps the tangent aligned with both adjoining segments.
+        const k = .5522847498;
+        turn = [entry, {x: entry.x + (p.x - entry.x) * k, y: entry.y + (p.y - entry.y) * k},
+          {x: exit.x + (p.x - exit.x) * k, y: exit.y + (p.y - exit.y) * k}, exit];
+        if (curveClear(turn)) break;
+        radius *= .75;
+      }
+      straight(turn[0]); curves.push(turn); cursor = turn[3];
+    }
+    straight(b);
+    return curves.every(curve => curveClear(curve)) ? encode(curves) : '';
+
+  };
 }
 
 function renderGraph(parent, nodes, edges, selectedId = null) {
@@ -498,12 +669,18 @@ function renderGraph(parent, nodes, edges, selectedId = null) {
     for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
     return node;
   };
-  const {points, lanes, width, height} = layoutGraph(nodes, edges);
+  const {points, width, height} = layoutGraph(nodes, edges, parent.clientWidth, selectedId);
   const svg = svgNode('svg', {viewBox: `0 0 ${width} ${height}`, role: 'group', 'aria-label': selectedId ? 'Experiment relationships' : 'All experiments graph'});
+  svg.classList.toggle('show-similar', Boolean(selectedId) || $('include-similar').checked);
+  const dense = edges.filter(edge => edge.directed).length > 20;
+  svg.style.setProperty('--source-opacity', dense ? '.3' : '.65');
+  const density = Math.max(1, edges.length / Math.max(nodes.length * 4, 1));
+  svg.style.setProperty('--similarity-opacity', String(.12 / density));
   const arrowId = selectedId ? 'lineage-arrow' : 'global-arrow';
   const defs = svgNode('defs'), marker = svgNode('marker', {id: arrowId, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto'});
   marker.append(svgNode('path', {d: 'M0,0 L10,5 L0,10 z', fill: '#758493'})); defs.append(marker); svg.append(defs);
-  const labels = {derived_from: 'continues', references: 'checkpoint use', same_artifact: 'identical file', possible_derivation: 'possible continuation', similar_to: 'similar'};
+  const routeEdge = graphRouter(points, width, height);
+  const labels = {derived_from: 'Continues', references: 'Uses checkpoint', same_artifact: 'Identical checkpoint', possible_derivation: 'May continue', similar_to: 'Similar settings / code'};
   const ports = new Map(), endpoints = new Map();
   for (const edge of edges) {
     const a = points.get(edge.source), b = points.get(edge.target);
@@ -517,18 +694,19 @@ function renderGraph(parent, nodes, edges, selectedId = null) {
   for (const entries of ports.values()) {
     entries.sort((a, b) => a.other.y - b.other.y || a.other.x - b.other.x || a.edge.id.localeCompare(b.edge.id));
     entries.forEach((entry, i) => endpoints.set(`${entry.edge.id}:${entry.index}`, {
-      x: entry.point.x + (entry.side === 'right' ? 220 : 0), y: entry.point.y + 8 + 40 * (i + 1) / (entries.length + 1),
-      sign: entry.side === 'right' ? 1 : -1, track: 16 + 44 * (i + 1) / (entries.length + 1)
+      x: entry.point.x + (entry.side === 'right' ? 220 : 0), y: entry.point.y + 12 + 40 * (i + 1) / (entries.length + 1),
+      sign: entry.side === 'right' ? 1 : -1
     }));
   }
-  // Paint similarity first so recorded sources stay visible above it.
+  // Route recorded sources first; paint them above the secondary relationships.
+  const routes = new Map();
+  for (const [index, edge] of [...edges].sort((a, b) => Number(b.directed) - Number(a.directed)).entries()) {
+    const lane = ((index * .61803398875) % 1 - .5) * 20;
+    routes.set(edge.id, routeEdge(endpoints.get(`${edge.id}:0`), endpoints.get(`${edge.id}:1`), edge.directed, lane));
+  }
   [...edges].sort((a, b) => Number(a.directed) - Number(b.directed)).forEach(edge => {
-    const a = endpoints.get(`${edge.id}:0`), b = endpoints.get(`${edge.id}:1`);
-    const lane = lanes.get(edge.id), bend = Math.max(40, Math.abs(b.x - a.x) * .45);
-    const route = lane === undefined
-      ? `M${a.x},${a.y} C${a.x + a.sign * bend},${a.y} ${b.x + b.sign * bend},${b.y} ${b.x},${b.y}`
-      : `M${a.x},${a.y} C${a.x + a.sign * a.track},${a.y} ${a.x + a.sign * a.track},${lane} ${a.x + a.sign * (a.track + 8)},${lane} L${b.x + b.sign * (b.track + 8)},${lane} C${b.x + b.sign * b.track},${lane} ${b.x + b.sign * b.track},${b.y} ${b.x},${b.y}`;
-    const tentative = edge.kind === 'possible_derivation';
+    const route = routes.get(edge.id);
+    const tentative = edge.kind === 'possible_derivation' || edge.description === 'Conflicting source records';
     const line = svgNode('path', {d: route, fill: 'none', stroke: tentative ? '#af7a28' : edge.directed ? '#527c9d' : '#a0acb8', 'stroke-width': edge.directed ? 1.8 : 1, class: edge.directed ? 'graph-edge' : 'graph-edge secondary', 'data-id': edge.id, 'data-source': edge.source, 'data-target': edge.target});
     if (edge.directed) line.setAttribute('marker-end', `url(#${arrowId})`);
     const title = svgNode('title'); title.textContent = `${edge.description || labels[edge.kind]} · ${Math.round(edge.confidence * 100)}% confidence`;
@@ -537,13 +715,16 @@ function renderGraph(parent, nodes, edges, selectedId = null) {
   for (const item of nodes) {
     const {x, y} = points.get(item.id), current = item.id === selectedId;
     const group = svgNode('g', {transform: `translate(${x} ${y})`, class: 'graph-node', 'data-id': item.id, tabindex: 0, role: 'button', 'aria-label': item.path});
-    group.append(svgNode('rect', {width: 220, height: 56, rx: 5, fill: current ? '#e8f2fc' : item.kind === 'collection' ? '#f3f5f7' : 'white', stroke: current ? '#3579bd' : '#c8d1da'}));
+    group.append(svgNode('rect', {width: 220, height: 64, rx: 5, fill: current ? '#e8f2fc' : item.kind === 'collection' ? '#f3f5f7' : 'white', stroke: current ? '#3579bd' : '#c8d1da'}));
     const title = svgNode('title'); title.textContent = item.path; group.append(title);
-    const name = svgNode('text', {x: 12, y: 24, fill: '#24292f', 'font-size': 12});
+    const name = svgNode('text', {x: 12, y: 24, fill: '#24292f', 'font-size': 14});
     name.textContent = item.name.length > 28 ? item.name.slice(0, 26) + '…' : item.name;
-    const hint = svgNode('text', {x: 12, y: 44, fill: '#687079', 'font-size': 10});
-    hint.textContent = item.kind === 'collection' ? `Collection · ${item.children.length} runs · ${item.subtree_checkpoint_count} checkpoints` : item.path.length > 32 ? '…' + item.path.slice(-30) : item.path;
-    group.append(name, hint);
+    const hint = svgNode('text', {x: 12, y: 40, fill: '#687079', 'font-size': 10});
+    hint.textContent = item.path.length > 32 ? '…' + item.path.slice(-30) : item.path;
+    const meta = svgNode('text', {x: 12, y: 55, fill: '#687079', 'font-size': 10});
+    const similarCount = links.get(item.id).filter(edge => !edge.directed).length;
+    meta.textContent = item.kind === 'collection' ? `Collection · ${item.children.length} runs` : `${item.checkpoint_count} checkpoint${item.checkpoint_count === 1 ? '' : 's'}${similarCount ? ` · ${similarCount} similar / identical` : ''}`;
+    group.append(name, hint, meta);
     group.onclick = () => showExperiment(item.id);
     const highlight = active => {
       const neighbors = new Set([item.id]);
@@ -568,12 +749,15 @@ function renderGraph(parent, nodes, edges, selectedId = null) {
     svg.style.width = `${width * scale}px`; svg.style.height = `${height * scale}px`;
     zoom.textContent = `${Math.round(scale * 100)}%`;
   }
-  for (const [label, action] of [['−', () => resize(scale / 1.25)], ['+', () => resize(scale * 1.25)], ['Fit', () => resize(Math.min(wrap.clientWidth / width, 600 / height, 1))], ['100%', () => resize(1)]]) {
+  for (const [label, action] of [['−', () => resize(scale / 1.25)], ['+', () => resize(scale * 1.25)], ['Fit', () => resize(Math.max(.75, Math.min(wrap.clientWidth / width, 1)))], ['100%', () => resize(1)]]) {
     const button = element('button', label); button.onclick = action; toolbar.append(button);
   }
   toolbar.append(zoom); parent.append(toolbar);
-  wrap.append(svg); parent.append(wrap); resize(1);
-  parent.append(element('p', 'Hover a node to highlight its connections; click for evidence. Arrows: source → experiment using it. Amber: uncertain. Gray: similarity or identical files.', 'path'));
+  wrap.append(svg); parent.append(wrap); resize(Math.max(.75, Math.min(wrap.clientWidth / width, 1)));
+  for (const text of svg.querySelectorAll('.graph-node text')) {
+    while (text.getComputedTextLength() > 196 && text.textContent.length > 2) text.textContent = text.textContent.replace(/…$/, '').slice(0, -1) + '…';
+  }
+  parent.append(element('p', 'Arrows show source → use; lines without arrows show similarity or identical files. Hover to highlight connections; click for evidence.', 'path'));
 }
 
 function showOverview(view) {
@@ -586,10 +770,10 @@ function showOverview(view) {
 }
 
 function renderOverviewGraph() {
-  const edges = REPORT.edges.filter(edge => edge.directed || $('include-similar').checked);
+  const edges = REPORT.edges;
   const sourceCount = edges.filter(edge => edge.directed).length;
   const collections = experiments.filter(item => item.kind === 'collection').length;
-  $('graph-count').textContent = `${experiments.length - collections} experiments${collections ? ` · ${collections} collections` : ''} · ${sourceCount} source links${edges.length > sourceCount ? ` · ${edges.length - sourceCount} similarity / identical-file links` : ''}. Experiments without links are shown separately.`;
+  $('graph-count').textContent = `${experiments.length - collections} experiments${collections ? ` · ${collections} collections` : ''} · ${sourceCount} source links · ${edges.length - sourceCount} similarity / identical-file links`;
   renderGraph($('global-graph'), experiments, edges);
   renderList();
 }
@@ -600,7 +784,7 @@ $('partial').hidden = !REPORT.statistics.partial;
 $('search').oninput = renderList;
 $('list-button').onclick = () => showOverview('list');
 $('graph-button').onclick = () => showOverview('graph');
-$('include-similar').onchange = renderOverviewGraph;
+$('include-similar').onchange = () => $('global-graph').querySelector('svg')?.classList.toggle('show-similar', $('include-similar').checked);
 $('download').onclick = event => {
   event.preventDefault();
   const url = URL.createObjectURL(new Blob([JSON.stringify(REPORT, null, 2)], {type: 'application/json'}));

@@ -20,7 +20,7 @@ def normalized(value):
     return posixpath.normpath(value.replace("\\", "/")).removeprefix("./")
 
 
-def comparable_config(experiment):
+def comparable_config(experiment, *, include_conflicts=False):
     result = {}
     if experiment.kind == "collection":
         return result
@@ -29,7 +29,7 @@ def comparable_config(experiment):
         if any(word in lower for word in ("sha256", "hash", "checkpoint", "references", "source", "output", "device", "gpu", "version", "time", "seed", "samples", "counts", "weights")):
             continue
         if isinstance(value, (str, int, float, bool)) and value != "[REDACTED]" and not str(value).startswith("[omitted"):
-            if any(source["value"] != value for source in experiment.config_sources.get(key, [])):
+            if not include_conflicts and any(source["value"] != value for source in experiment.config_sources.get(key, [])):
                 continue
             result[key] = value
     return result
@@ -57,7 +57,7 @@ def local_scripts(experiment):
             if any(source.split("#", 1)[0] not in inherited for source in sources)}
 
 
-def similarity_details(left, right, changes, matched, shared_scripts, score):
+def similarity_details(left, right, changes, matched, shared_scripts, score, uncompared):
     """Describe observed differences; borrowed configuration is weaker evidence."""
     roles = set(left.roles) & set(right.roles)
     ambiguous_roles = (set(left.role_sources) - set(left.roles)) | (set(right.role_sources) - set(right.roles))
@@ -72,8 +72,15 @@ def similarity_details(left, right, changes, matched, shared_scripts, score):
         return None  # Different components across batches are not model variants.
     if not independent and not shared_parent:
         return None
-    confidence = min(score, .85)
+    has_code = bool(left.script_hashes and right.script_hashes)
+    confidence = min(score, .85 if has_code else .7)
     caveats = []
+    if uncompared:
+        caveats.append("Missing or conflicting values prevent comparing all recorded settings; unavailable values are not changes.")
+    if not has_code:
+        caveats.append("Code snapshots are unavailable for one or both runs; comparison uses recorded configuration.")
+    elif not shared_scripts:
+        caveats.append("Code snapshots differ; behavior may differ beyond the recorded settings.")
     if len(local_matches) < len(matched) / 2:
         confidence = min(confidence, .65)
         caveats.append("Most matching settings come from inferred parent configuration; component applicability is not verified.")
@@ -91,12 +98,14 @@ def similarity_details(left, right, changes, matched, shared_scripts, score):
         seed_a, seed_b = training_seed(left), training_seed(right)
         seed_changed = seed_a is not None and seed_b is not None and seed_a != seed_b
         if not changes and seed_changed:
-            if local_scripts(left) and local_scripts(right) and local_scripts(left) != local_scripts(right):
+            if uncompared:
+                description = f"Recorded seed differs ({seed_a} vs {seed_b}); configuration partly comparable"
+            elif local_scripts(left) and local_scripts(right) and local_scripts(left) != local_scripts(right):
                 description = f"Recorded seed differs ({seed_a} vs {seed_b}); code snapshots also differ"
             else:
                 description = f"Recorded settings match except seed ({seed_a} vs {seed_b})"
         elif changes:
-            structural = [key for key in changes if re.search(r"(^|[._])(architecture|model|model_type|module|layers|num_layers|hidden_dim|hidden_size|head_dim)([._]|$)", key, re.I)]
+            structural = [key for key in changes if re.search(r"(^|[._])(architecture|model|model_type|module|layers|num_layers|hidden|hidden_dim|hidden_size|head_dim)([._]|$)", key, re.I)]
             dataset = [key for key in changes if re.search(r"(^|[._])(dataset|data|split)([._]|$)", key, re.I)]
             keys = structural or dataset or list(changes)
             category = "Model configuration differs" if structural else "Dataset configuration differs" if dataset else "Training settings differ"
@@ -104,25 +113,22 @@ def similarity_details(left, right, changes, matched, shared_scripts, score):
             if seed_changed:
                 description += f"; seed {seed_a} vs {seed_b}"
         else:
-            description = "Matching recorded configuration" + (" and code" if shared_local_scripts else "")
+            description = ("Matching comparable settings; full configuration uncertain" if uncompared else
+                           "Matching recorded configuration" + (" and code" if shared_local_scripts else ""))
         if seed_changed:
             changes["seed"] = {"source": seed_a, "target": seed_b}
     for key, value in role_changes.items():
         changes["role." + key] = value
     facts = [{"signal": "run-local configuration support", "matched_fields": local_matches,
               "inherited_match_count": len(matched) - len(local_matches)}]
+    if uncompared:
+        facts.append({"signal": "unavailable comparison fields", "fields": uncompared})
     for side, experiment in (("source", left), ("target", right)):
         for role in sorted(experiment.role_sources):
             facts.extend({"signal": f"recorded {side} role", **source} for source in experiment.role_sources.get(role, []))
     if shared_parent:
         facts.append({"signal": "shared parent configuration", "artifacts": sorted(shared_parent)})
     return description, confidence, caveats, facts, bool(role_changes or ambiguous_roles), len(local_matches)
-
-
-def name_tokens(name):
-    # Generic names and revision numbers contribute no relationship evidence.
-    tokens = set(re.findall(r"[a-z]+", name.lower()))
-    return tokens - {"final", "new", "folder", "best", "last", "run", "runs", "pt", "pth", "ckpt", "s", "seed", "v", "copy", "checkpoint"}
 
 
 def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pairs=200_000):
@@ -139,7 +145,11 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
         existing = edges.get(item.id)
         if existing:
             existing.evidence.extend(e for e in item.evidence if e not in existing.evidence)
+            existing.caveats.extend(note for note in item.caveats if note not in existing.caveats)
             existing.confidence = max(existing.confidence, item.confidence)
+            if "Conflicting source records" in {existing.description, item.description}:
+                existing.description = "Conflicting source records"
+                existing.confidence = min(existing.confidence, .5)
         else:
             edges[item.id] = item
 
@@ -182,8 +192,21 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
         return owners, method, [item.path for item in matches]
 
     for experiment in experiments:
-        for reference in experiment.references:
-            targets, method, files = resolve(reference)
+        resolved = [(reference, *resolve(reference)) for reference in experiment.references]
+        declared = {target for ref, targets, _, _ in resolved if ref.get("purpose") == "declared_source" for target in targets}
+        evaluated = {target for ref, targets, _, _ in resolved if ref.get("purpose") == "evaluation" for target in targets if target != experiment.id}
+        source_conflict = bool(declared and evaluated and not evaluated <= declared)
+        resumes = defaultdict(set)
+        for ref, targets, _, _ in resolved:
+            if ref["kind"] == "derived_from" and ref["role"] == "config":
+                resumes[ref["field"]].update(targets)
+        conflicting_fields = {field for field, targets in resumes.items() if len(targets) > 1}
+        if source_conflict or conflicting_fields:
+            experiment.warnings.append("Conflicting source records; inspect the declared source and evaluation/configuration paths. Origin is uncertain.")
+        for reference, targets, method, files in resolved:
+            conflict = (source_conflict and reference.get("purpose") in {"declared_source", "evaluation"}) or reference["field"] in conflicting_fields
+            if conflict:
+                reference["conflict"] = True
             if targets == [experiment.id]:
                 reference["resolution"] = "self"
                 continue
@@ -209,8 +232,14 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
                     kind = "possible_derivation"
             if kind == "references":
                 caveats.append("A checkpoint reference can mean evaluation, teacher use, or initialization; it does not establish fine-tuning.")
-            add(edge(source.id, experiment.id, kind, confidence,
-                     [{"signal": method, "artifact": reference["artifact"], "field": reference["field"], "value": reference["value"], "matched_artifacts": files}], caveats=caveats))
+            if conflict:
+                confidence = min(confidence, .5)
+                caveats.append("Conflicting source records: the declared origin and other records disagree; this link is uncertain.")
+            relation = edge(source.id, experiment.id, kind, confidence,
+                            [{"signal": method, "artifact": reference["artifact"], "field": reference["field"], "value": reference["value"], "matched_artifacts": files}], caveats=caveats)
+            if conflict:
+                relation.description = "Conflicting source records"
+            add(relation)
 
     # Parent manifests can bind stages by paths even without checkpoint hashes.
     for artifact in artifacts:
@@ -257,6 +286,7 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
                      caveats=["Shared checkpoint bytes do not identify copy direction or prove the runs are identical."]))
 
     configs = {exp.id: comparable_config(exp) for exp in experiments}
+    recorded_configs = {exp.id: comparable_config(exp, include_conflicts=True) for exp in experiments}
     # Candidate blocks require actual matching config values or source hashes, never a name alone.
     blocks = defaultdict(list)
     for exp in experiments:
@@ -290,21 +320,25 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
         config_score = len(matched) / max(len(set(a) | set(b)), 1)
         shared_scripts = sorted(set(left.script_hashes) & set(right.script_hashes))
         script_score = len(shared_scripts) / max(len(set(left.script_hashes) | set(right.script_hashes)), 1)
-        names_a, names_b = name_tokens(left.name), name_tokens(right.name)
-        name_score = len(names_a & names_b) / max(len(names_a | names_b), 1)
-        score = .65 * config_score + .25 * script_score + .1 * name_score
+        # Directory names must not decide whether otherwise identical evidence links.
+        # Config-only comparisons need stronger agreement (75% at the default
+        # threshold); absent code is weaker evidence, not a code mismatch.
+        score = .75 * config_score + .25 * script_score if left.script_hashes and right.script_hashes else .8 * config_score
         if len(matched) < 3 or score < similarity_threshold:
             continue
-        changes = {key: {"source": a.get(key), "target": b.get(key)} for key in sorted(set(a) | set(b)) if a.get(key) != b.get(key)}
+        # Keep the conservative union-based score, but only call known values changes.
+        changes = {key: {"source": a[key], "target": b[key]} for key in sorted(common) if a[key] != b[key]}
+        uncompared = sorted((set(recorded_configs[left_id]) | set(recorded_configs[right_id])) - common)
+        if any(key in exp.config for exp in (left, right) for key in ("train.seed", "training.seed", "seed", "config.seed")) and (training_seed(left) is None or training_seed(right) is None):
+            uncompared.append("seed")
         config_changed = bool(changes)
-        details = similarity_details(left, right, changes, matched, shared_scripts, score)
+        details = similarity_details(left, right, changes, matched, shared_scripts, score, uncompared)
         if details is None:
             continue
         description, confidence, caveats, facts, role_conflict, local_matches = details
         evidence = [{"signal": "configuration agreement", "matched_fields": matched, "score": round(config_score, 3),
                      "sources": {key: [left.config_sources.get(key, []), right.config_sources.get(key, [])] for key in matched}},
-                    {"signal": "source hash overlap", "shared_hashes": shared_scripts, "score": round(script_score, 3)},
-                    {"signal": "weak name token overlap", "tokens": sorted(names_a & names_b), "score": round(name_score, 3)}]
+                    {"signal": "source hash overlap", "shared_hashes": shared_scripts, "score": round(script_score, 3)}]
         evidence.extend(facts)
         item = edge(left_id, right_id, "similar_to", confidence, evidence, directed=False,
                     caveats=["Similarity is not ancestry. Scores are heuristic, not calibrated probabilities.", *caveats], changes=changes)
@@ -316,11 +350,11 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
         seeds = training_seed(earlier), training_seed(later)
         seed_conflict = all(value is not None for value in seeds) and seeds[0] != seeds[1]
         if score >= .8 and shared_scripts and config_changed and local_matches >= 3 and not role_conflict and not seed_conflict and earlier.finished is not None and later.started is not None and earlier.finished <= later.started:
-            changes = {key: {"source": configs[earlier.id].get(key), "target": configs[later.id].get(key)} for key in sorted(set(a) | set(b)) if a.get(key) != b.get(key)}
+            changes = {key: {"source": configs[earlier.id][key], "target": configs[later.id][key]} for key in sorted(common) if a[key] != b[key]}
             item = edge(earlier.id, later.id, "possible_derivation", min(score, .75), evidence + [
                 {"signal": "explicit run chronology", "source_finished": earlier.finished, "target_started": later.started,
                  "time_sources": earlier.time_sources + later.time_sources}],
-                caveats=["Chronology and shared configuration/code suggest an alternative, not proven ancestry; runs may be independent."], changes=changes)
+                caveats=["Chronology and shared configuration/code suggest an alternative, not proven ancestry; runs may be independent.", *caveats], changes=changes)
         # Keep every supported relationship. Presentation must not prune evidence.
         add(item)
 
