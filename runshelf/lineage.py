@@ -63,7 +63,7 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
             edges[item.id] = item
 
     def resolve(reference):
-        value = normalized(reference["value"])
+        value = normalized(reference.get("resolved_value", reference["value"]))
         source_dir = str(PurePosixPath(reference["artifact"]).parent)
         bases = [PurePosixPath(source_dir), *PurePosixPath(source_dir).parents]
         # Original relative context takes precedence; suffix matching handles moved trees.
@@ -121,10 +121,49 @@ def infer(experiments, artifacts, ownership, *, similarity_threshold=.6, max_pai
                 caveats.append("Run timestamps conflict with the reference direction; inspect evidence.")
                 confidence = min(confidence, .6)
             kind = reference["kind"]
+            if reference.get("inherited"):
+                confidence = min(confidence, .65)
+                caveats.append("Shared parent configuration; its applicability to this run is inferred.")
+                if kind == "derived_from":
+                    kind = "possible_derivation"
             if kind == "references":
                 caveats.append("A checkpoint reference can mean evaluation, teacher use, or initialization; it does not establish fine-tuning.")
             add(edge(source.id, experiment.id, kind, confidence,
                      [{"signal": method, "artifact": reference["artifact"], "field": reference["field"], "value": reference["value"], "matched_artifacts": files}], caveats=caveats))
+
+    # Parent manifests can bind stages by paths even without checkpoint hashes.
+    for artifact in artifacts:
+        for binding in artifact.metadata.get("record_links", []):
+            def resolve_stage(value):
+                return resolve({"value": value, "artifact": artifact.path, "kind": "references"})
+            sources, source_method, source_files = resolve_stage(binding["source"])
+            targets, target_method, target_files = resolve_stage(binding["target"])
+            if len(sources) == len(targets) == 1 and sources != targets:
+                add(edge(sources[0], targets[0], binding["kind"], .9 if source_method.startswith("explicit") and target_method.startswith("explicit") else .78,
+                         [{"signal": "explicit stage dependency", "artifact": artifact.path, "field": binding["field"],
+                           "value": binding["source"], "target_checkpoint": binding["target"], "matched_artifacts": source_files + target_files}]))
+            elif not sources or not targets or len(sources) > 1 or len(targets) > 1:
+                warnings.append({"kind": "inference", "path": artifact.path, "message": f"Unresolved or ambiguous stage dependency: {binding['source']} -> {binding['target']}."})
+
+    # A parent manifest may describe multiple child runs without belonging to any
+    # one of them. Bind both ends by checkpoint bytes, never by directory names.
+    for artifact in artifacts:
+        for binding in artifact.metadata.get("component_links", []):
+            source_files = hash_index.get(binding["source_sha256"], [])
+            target_files = hash_index.get(binding["target_sha256"], [])
+            sources = {ownership[item.id] for item in source_files if item.id in ownership}
+            targets = {ownership[item.id] for item in target_files if item.id in ownership}
+            if len(sources) != 1 or len(targets) != 1:
+                warnings.append({"kind": "inference", "path": artifact.path,
+                                 "message": f"Component {binding['component']}: checkpoint hashes are unavailable or match multiple runs; source link left unresolved."})
+                continue
+            source, target = next(iter(sources)), next(iter(targets))
+            if source != target:
+                add(edge(source, target, "references", .85,
+                         [{"signal": "recorded frozen component; source and target checkpoint hashes verified",
+                           "artifact": artifact.path, **binding,
+                           "matched_artifacts": [item.path for item in source_files + target_files]}],
+                         caveats=["Component mapping is declared in metadata; model weights were not independently compared."]))
 
     for digest, items in sorted(hash_index.items()):
         owners = sorted({ownership[item.id] for item in items if item.id in ownership})

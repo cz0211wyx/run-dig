@@ -99,6 +99,143 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((by_id[relations[0].source], by_id[relations[0].target]), ("base", "new folder"))
         self.assertIn("config.json", relations[0].evidence[0]["artifact"])
 
+    def test_initialization_and_component_paths_need_no_hashes(self):
+        for name in ('new folder', 'another model', 'consumer'):
+            self.run_folder(name)
+        self.put('consumer/config.json', {'lr': .01, 'batch_size': 16,
+                                         'initial_backbone_source': '../new folder/best.pt',
+                                         'experts': ['../another model/best.pt']})
+        report = self.report(hash_limit=0)
+        names = {node.id: node.path for node in report.experiments}
+        found = {(names[e.source], names[e.target], e.kind) for e in report.edges if e.directed}
+        self.assertEqual(found, {('new folder', 'consumer', 'derived_from'), ('another model', 'consumer', 'references')})
+
+    def test_seed_path_template_uses_recorded_value(self):
+        self.run_folder('source_17')
+        self.run_folder('target')
+        self.put('target/config.json', {'seed': 17, 'lr': .01, 'batch_size': 16,
+                                        'joint_initialization': '../source_{seed}/best.pt'})
+        report = self.report(hash_limit=0)
+        self.assertEqual([e.kind for e in report.edges], ['derived_from'])
+        self.assertIn('source_17/best.pt', report.edges[0].evidence[0]['matched_artifacts'])
+
+    def test_ambiguous_template_is_not_guessed(self):
+        self.run_folder('source_17')
+        self.run_folder('target', init_from='../source_{seed}/best.pt')
+        self.put('target/config.json', {'lr': .01, 'batch_size': 16, 'a.seed': 17, 'b.seed': 99,
+                                        'init_from': '../source_{seed}/best.pt'})
+        report = self.report()
+        self.assertFalse(any(e.directed for e in report.edges))
+        self.assertEqual(report.statistics['unresolved_references'], 1)
+
+    def test_manifest_stage_dependencies_need_no_hashes(self):
+        self.run_folder('renamed/source')
+        self.run_folder('random final')
+        self.put('pipeline.json', {'stages': [
+            {'name': 'encoder', 'checkpoint': 'renamed/source/best.pt'},
+            {'name': 'consumer', 'checkpoint': 'random final/best.pt', 'components': ['encoder']}]})
+        report = self.report(hash_limit=0)
+        names = {node.id: node.path for node in report.experiments}
+        relations = [e for e in report.edges if e.directed]
+        self.assertEqual([(names[e.source], names[e.target]) for e in relations], [('renamed/source', 'random final')])
+        self.assertEqual(relations[0].evidence[0]['artifact'], 'pipeline.json')
+
+    def test_colocated_runs_without_dependencies_are_not_connected_as_sources(self):
+        for name in ('a', 'b', 'c'):
+            self.run_folder('collection/' + name)
+        self.put('collection/state.json', {'completed': [{'name': name, 'checkpoint': name + '/best.pt'} for name in ('a', 'b', 'c')]})
+        self.assertFalse(any(edge.directed for edge in self.report().edges))
+
+    def test_manifest_frozen_components_bind_renamed_runs(self):
+        import hashlib
+        self.run_folder('arbitrary source')
+        self.run_folder('arbitrary target')
+        fingerprint = lambda text: hashlib.sha256(text.encode()).hexdigest()
+        self.put('batch/state.json', {'completed': [
+            {'phase': 'branch red', 'checkpoint_sha256': fingerprint('arbitrary source')},
+            {'phase': 'combined', 'checkpoint_sha256': fingerprint('arbitrary target'),
+             'frozen_components_unchanged': True,
+             'frozen_component_state_sha256': {'branch red': {str(i): fingerprint(str(i)) for i in range(4)}}}]})
+        report = self.report()
+        relations = [e for e in report.edges if e.directed]
+        self.assertEqual(len(relations), 1)
+        self.assertEqual(relations[0].kind, 'references')
+        self.assertLess(relations[0].confidence, .9)
+        self.assertTrue(relations[0].caveats)
+        # Duplicate bytes cannot identify which run supplied the component.
+        self.run_folder('duplicate')
+        self.put('duplicate/best.pt', b'arbitrary source')
+        ambiguous = self.report()
+        self.assertFalse(any(e.directed for e in ambiguous.edges))
+        self.assertTrue(any('multiple runs' in w['message'] for w in ambiguous.warnings))
+
+    def test_evaluation_with_config_and_metrics_is_a_graph_node(self):
+        self.run_folder('trained')
+        self.put('evaluation/inference_config.json', {'checkpoint': '../trained/best.pt'})
+        self.put('evaluation/metrics.json', {'accuracy': .9})
+        report = self.report(hash_limit=0)
+        names = {node.id: node.path for node in report.experiments}
+        self.assertTrue(any(names[e.source] == 'trained' and names[e.target] == 'evaluation' for e in report.edges))
+
+    def test_shared_parent_config_is_tentative_and_never_overrides_local_config(self):
+        self.run_folder('source')
+        self.put('trial/config.json', {'lr': .01, 'batch_size': 16, 'initial_model': '../source/best.pt'})
+        self.put('trial/a/best.pt', b'a')
+        self.put('trial/a/train.log', 'epoch=1 loss=0.5')
+        self.run_folder('trial/b')
+        report = self.report(hash_limit=0)
+        names = {node.id: node.path for node in report.experiments}
+        inferred = [edge for edge in report.edges if edge.directed]
+        self.assertEqual([(names[e.source], names[e.target], e.kind) for e in inferred], [('source', 'trial/a', 'possible_derivation')])
+        self.assertLessEqual(inferred[0].confidence, .65)
+        self.assertTrue(any('Shared parent' in c for c in inferred[0].caveats))
+
+    def test_log_quoted_path_and_static_script_path(self):
+        self.run_folder('old folder')
+        self.run_folder('log consumer')
+        self.run_folder('script consumer')
+        self.put('log consumer/train.log', 'Resuming from "../old folder/best.pt"\n')
+        self.put('script consumer/train.py', 'from pathlib import Path\nbase = Path("../old folder")\ncheckpoint = base / "best.pt"\nmodel = load_checkpoint(checkpoint)\nraise RuntimeError("do not execute")\n')
+        report = self.report(hash_limit=0)
+        names = {node.id: node.path for node in report.experiments}
+        relations = {names[e.target]: e for e in report.edges if e.directed}
+        self.assertEqual(set(relations), {'log consumer', 'script consumer'})
+        self.assertEqual(relations['log consumer'].kind, 'derived_from')
+        self.assertLessEqual(relations['script consumer'].confidence, .65)
+
+    def test_inspect_checkpoint_prints_context_without_writing_report(self):
+        self.run_folder('parent')
+        self.run_folder('child', resume_from='../parent/best.pt')
+        output = io.StringIO()
+        before = sorted(p.relative_to(self.root) for p in self.root.rglob('*'))
+        with contextlib.redirect_stdout(output):
+            result = main(['inspect', 'child/best.pt', '--root', str(self.root)])
+        self.assertEqual(result, 0)
+        for text in ('Checkpoint:', 'Size:', 'Modified:', 'Experiment: child', 'Sources:', 'parent', 'Run configuration:', 'train.lr', 'Run metrics:'):
+            self.assertIn(text, output.getvalue())
+        self.assertEqual(before, sorted(p.relative_to(self.root) for p in self.root.rglob('*')))
+        full = io.StringIO()
+        with contextlib.redirect_stdout(full):
+            self.assertEqual(main(['inspect', 'child/best.pt', '--root', str(self.root), '--full']), 0)
+        self.assertIn('train.resume_from', full.getvalue())
+
+    def test_conditional_script_paths_are_not_resolved_as_constants(self):
+        self.run_folder('base')
+        self.run_folder('target')
+        self.put('target/train.py', 'checkpoint = "../base/best.pt"\nif something:\n    checkpoint = unknown_value\nload_checkpoint(checkpoint)\n')
+        self.assertFalse(any(edge.directed for edge in self.report().edges))
+
+    def test_inspect_supports_checkpoint_subfolder_and_missing_files(self):
+        self.put('run/config.json', {'lr': .01, 'batch_size': 16})
+        checkpoint = self.put('run/checkpoints/final.pt', b'opaque')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(['inspect', str(checkpoint)]), 0)
+        self.assertIn('lr: 0.01', output.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(['inspect', str(self.root / 'absent.pt')]), 2)
+            self.assertEqual(main(['inspect', str(checkpoint), '--root', str(self.root / 'other')]), 2)
+
     def test_reference_is_not_automatically_derivation(self):
         self.run_folder("base")
         self.run_folder("evaluator", references=[{"checkpoint": "../base/best.pt"}])

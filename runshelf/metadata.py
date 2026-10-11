@@ -68,18 +68,102 @@ def parse_time(value):
 
 def reference_kind(key):
     key = key.lower()
-    if any(word in key for word in ("resume", "init_from", "init_checkpoint", "parent_run", "warm_start", "finetune_from")):
+    if any(word in key for word in ("resume", "init_from", "init_checkpoint", "initial_", "initialization", "parent_run", "warm_start", "finetune_from")):
         return "derived_from"
-    if any(word in key for word in ("source_checkpoint", "pretrained", "teacher", "reference", "checkpoint", "load_from")):
+    if any(word in key for word in ("source_checkpoint", "pretrained", "teacher", "reference", "checkpoint", "load_from",
+                                    "expert", "component", "branch", "dependency", "dependencies", "input_model", "weights", "source")):
         return "references"
     return None
 
 
+def expand_reference(value, fields, key):
+    """Substitute a simple {seed} only when its value is unambiguous in metadata."""
+    namespace = key.rsplit(".", 1)[0] + "." if "." in key else ""
+    def replace(match):
+        name = match.group(1)
+        choices = [fields[candidate] for candidate in (namespace + name, name) if candidate in fields]
+        if not choices:
+            choices = [v for k, v in fields.items() if k.endswith("." + name)]
+        values = {str(v) for v in choices if isinstance(v, (str, int, float)) and not isinstance(v, bool)}
+        return next(iter(values)) if len(values) == 1 else match.group(0)
+    return re.sub(r"\{([A-Za-z_]\w*)\}", replace, value)
+
+
+def record_links(fields):
+    """Connect stages explicitly declared in a manifest, without requiring hashes."""
+    records = {}
+    for key, value in fields.items():
+        if key.rsplit(".", 1)[-1] in {"checkpoint", "checkpoint_path", "output_checkpoint"} and isinstance(value, str) and CHECKPOINT.search(value):
+            prefix = key.rsplit(".", 1)[0] + "." if "." in key else ""
+            if key.endswith("output_checkpoint") or any(isinstance(fields.get(prefix + label), str) for label in ("phase", "stage", "id", "name")):
+                records[prefix] = value
+    labels = defaultdict(list)
+    for prefix, path in records.items():
+        label = next((fields[prefix + key] for key in ("phase", "stage", "id", "name") if isinstance(fields.get(prefix + key), str)), None)
+        if label:
+            labels[label].append(path)
+    result = []
+    for prefix, target in records.items():
+        for key, value in fields.items():
+            if not key.startswith(prefix) or not reference_kind(key[len(prefix):]):
+                continue
+            # Do not borrow a dependency from a nested/sibling stage record.
+            if any(other != prefix and len(other) > len(prefix) and key.startswith(other) for other in records):
+                continue
+            for source in value if isinstance(value, list) else [value]:
+                if not isinstance(source, str):
+                    continue
+                if not CHECKPOINT.search(source):
+                    matches = labels.get(source, [])
+                    if len(matches) != 1:
+                        continue
+                    source = matches[0]
+                if source != target:
+                    result.append({"source": expand_reference(source, fields, key), "target": expand_reference(target, fields, prefix),
+                                   "kind": reference_kind(key[len(prefix):]), "field": key})
+    return result
+
+
+def component_links(fields):
+    """Read frozen-component bindings from multi-stage training manifests."""
+    records = []
+    for key, digest in fields.items():
+        if not key.endswith("checkpoint_sha256") or not isinstance(digest, str) or not HASH.fullmatch(digest):
+            continue
+        prefix = key[:-len("checkpoint_sha256")]
+        label = next((fields[prefix + name] for name in ("phase", "stage", "id", "name")
+                      if isinstance(fields.get(prefix + name), str)), None)
+        if label:
+            records.append((prefix, label, digest.lower()))
+    result = []
+    for target, _, target_hash in records:
+        if not any(fields.get(target + flag) is True for flag in ("frozen_experts_unchanged", "frozen_components_unchanged")):
+            continue
+        for source, label, source_hash in records:
+            if source == target or sum(record[1] == label for record in records) != 1:
+                continue
+            for group in ("frozen_expert_state_sha256", "frozen_component_state_sha256"):
+                field = target + group + "." + label
+                count = sum(key.startswith(field + ".") and isinstance(value, str) and bool(HASH.fullmatch(value))
+                            for key, value in fields.items())
+                if count >= 3:
+                    result.append({"component": label, "source_sha256": source_hash, "target_sha256": target_hash,
+                                   "source_record": source.rstrip("."), "target_record": target.rstrip("."),
+                                   "field": field, "parameter_hashes": count})
+    return result
+
+
 def extract_fields(fields, source, *, role):
-    metadata = {"fields": fields, "metrics": {}, "references": [], "script_hashes": {}, "times": {}}
+    metadata = {"fields": fields, "metrics": {}, "references": [], "script_hashes": {}, "times": {},
+                "component_links": component_links(fields), "record_links": record_links(fields)}
     for key, value in fields.items():
         if value == "[REDACTED]":
             continue
+        if isinstance(value, list) and reference_kind(key):
+            for index, path in enumerate(value):
+                if isinstance(path, str) and CHECKPOINT.search(path.strip()):
+                    metadata["references"].append({"value": path, "field": f"{key}[{index}]", "artifact": source,
+                                                   "kind": reference_kind(key), "role": role})
         if isinstance(value, (int, float)) and not isinstance(value, bool) and METRIC.search(key):
             metadata["metrics"][key] = value
         lower = key.lower()
@@ -89,7 +173,8 @@ def extract_fields(fields, source, *, role):
             kind = reference_kind(key)
             if CHECKPOINT.search(value.strip()) or (kind == "derived_from" and value.strip()):
                 if kind:
-                    reference = {"value": value, "field": key, "artifact": source, "kind": kind, "role": role}
+                    reference = {"value": value, "resolved_value": expand_reference(value, fields, key),
+                                 "field": key, "artifact": source, "kind": kind, "role": role}
                     hash_key = key.rsplit(".", 1)[0] + ".sha256"
                     if HASH.fullmatch(str(fields.get(hash_key, ""))):
                         reference["sha256"] = fields[hash_key].lower()
@@ -122,6 +207,43 @@ def script_fields(text, suffix):
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError):
         return fields
+    constants = {}
+
+    def literal(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return constants.get(node.id)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"Path", "PurePath"} and len(node.args) == 1:
+            return literal(node.args[0])
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
+            left, right = literal(node.left), literal(node.right)
+            if left is not None and right is not None:
+                return str(PurePosixPath(left) / right) if isinstance(node.op, ast.Div) else left + right
+        return None
+
+    # Resolve only straight-line module constants. Never evaluate source code or
+    # borrow values from another function/conditional scope.
+    for node in tree.body:
+        if isinstance(node, (ast.If, ast.For, ast.While, ast.Try, ast.With)):
+            for changed in ast.walk(node):
+                if isinstance(changed, ast.Name) and isinstance(changed.ctx, ast.Store):
+                    constants.pop(changed.id, None)
+        if isinstance(node, ast.Assign):
+            value = literal(node.value)
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = value
+        for call in ast.walk(node):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.If, ast.For, ast.While, ast.Try, ast.With)):
+                break
+            if not isinstance(call, ast.Call):
+                continue
+            method = call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id if isinstance(call.func, ast.Name) else ""
+            if method in {"load", "load_checkpoint", "load_from_checkpoint", "load_weights"} and call.args:
+                path = literal(call.args[0])
+                if path and CHECKPOINT.search(path):
+                    fields[f"checkpoint.line_{call.lineno}"] = path
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
             for target in node.targets:
@@ -210,10 +332,10 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
             for line in text.splitlines()[:record_limit]:
                 for key, value in re.findall(r"\b([\w.]+)\s*[:=]\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)", line):
                     fields[key] = scalar(float(value))
-                match = re.search(r"(?:resum\w*|load\w*|initializ\w*|warm.start)\s+(?:\w+\s+){0,3}?(?:from\s+)?[\"']?([^\s\"']+\.(?:pt|pth|ckpt|safetensors))", line, re.I)
+                match = re.search(r'''(?:resum\w*|load\w*|initializ\w*|warm.start)\s+(?:\w+\s+){0,3}?(?:from\s+)?(?:["']([^"']+\.(?:pt|pth|ckpt|safetensors))["']|([^\s"']+\.(?:pt|pth|ckpt|safetensors)))''', line, re.I)
                 if match:
                     prefix = "resume" if "resum" in line.lower() else "checkpoint"
-                    fields[f"{prefix}.{len(fields)}"] = match.group(1)
+                    fields[f"{prefix}.{len(fields)}"] = match.group(1) or match.group(2)
         artifact.metadata = extract_fields(fields, artifact.path, role=artifact.kind)
         # Arbitrarily named JSON can still contain a training configuration.
         leaves = {key.split(".")[-1].lower() for key in fields}
@@ -242,6 +364,7 @@ def identify(artifacts):
         training = any(item.metadata.get("training_signal") for item in items if item.kind == "config")
         config = any(item.kind == "config" and item.metadata.get("fields") for item in items)
         metrics = any(item.metadata.get("metrics") for item in items if item.kind in {"metrics", "log"})
+        references = any(item.metadata.get("references") for item in items if item.kind == "config")
         state = any(PurePosixPath(item.path).name.lower() in {"state.json", "run.json", "status.json", "metadata.json"}
                     and item.metadata.get("times") for item in items)
         child_checkpoint = any(
@@ -252,7 +375,7 @@ def identify(artifacts):
         # Config subfolders are supporting evidence, not independent runs.
         if PurePosixPath(directory).name in {"configs", ".hydra"}:
             continue
-        if (config and ("checkpoint" in kinds or child_checkpoint or (training and metrics))) or (state and metrics) or ("checkpoint" in kinds and metrics):
+        if (config and ("checkpoint" in kinds or child_checkpoint or ((training or references) and metrics))) or (state and metrics) or ("checkpoint" in kinds and metrics):
             evidence = []
             if config:
                 evidence.append("Configuration and run artifacts colocated.")
@@ -304,6 +427,16 @@ def identify(artifacts):
     index = {item.id: item for item in artifacts}
     for experiment in experiments:
         members = [index[key] for key in experiment.artifacts]
+        shared = set()
+        if experiment.kind == "experiment" and not any(item.kind == "config" for item in members):
+            parent = str(PurePosixPath(experiment.path).parent)
+            nearby = by_dir.get(parent, [])
+            if not any(item.kind == "checkpoint" for item in nearby):
+                for item in nearby:
+                    if item.kind == "config" and item.metadata.get("training_signal"):
+                        members.append(item)
+                        shared.add(item.id)
+                        experiment.warnings.append(f"Shared parent config: {item.path}; applicability to this run is inferred.")
         # Config facts take precedence over summaries; conflicts keep every source.
         members.sort(key=lambda item: (item.kind != "config", item.path))
         for item in members:
@@ -317,6 +450,8 @@ def identify(artifacts):
                     if value == "[REDACTED]":
                         continue
                     source = {"artifact": item.path, "value": value}
+                    if item.id in shared:
+                        source["inherited"] = True
                     experiment.config_sources.setdefault(key, []).append(source)
                     if key in experiment.config and experiment.config[key] != value:
                         experiment.warnings.append(f"Conflicting config value for {key}; see config_sources.")
@@ -327,12 +462,15 @@ def identify(artifacts):
                     metric_key = f"{PurePosixPath(item.path).name}:{key}"
                     experiment.metrics[metric_key] = value
                     experiment.metric_sources[metric_key] = item.path
-            experiment.references.extend(metadata.get("references", []))
+            experiment.references.extend({**reference, "inherited": True} if item.id in shared else dict(reference)
+                                         for reference in metadata.get("references", []))
             if item.kind == "script" and item.sha256:
                 experiment.script_sources.setdefault(item.sha256, []).append(item.path)
             for key, digest in metadata.get("script_hashes", {}).items():
                 experiment.script_sources.setdefault(digest, []).append(f"{item.path}#{key} (declared)")
             for key, entry in metadata.get("times", {}).items():
+                if item.id in shared:
+                    continue
                 old = getattr(experiment, key)
                 value = entry["value"]
                 if old is None or (key == "started" and value < old) or (key == "finished" and value > old):

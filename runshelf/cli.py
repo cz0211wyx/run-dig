@@ -1,6 +1,7 @@
-"""Two commands: analyze experiments, or list checkpoint files."""
+"""Scan experiments, list checkpoints, or inspect one checkpoint."""
 
 import argparse
+import json
 import os
 import sys
 import webbrowser
@@ -8,7 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__
-from .scan import analyze
+from .scan import CHECKPOINT_EXTENSIONS, analyze
+from .metadata import ARTIFACT_FOLDERS
 from .report import validate_output, write_report
 
 
@@ -66,6 +68,69 @@ def list_checkpoints(args):
     return 1 if errors else 0
 
 
+def inspect_checkpoint(args):
+    checkpoint = args.checkpoint.expanduser()
+    root = args.root.expanduser().resolve() if args.root else None
+    checkpoint = ((root / checkpoint) if root and not checkpoint.is_absolute() else checkpoint).resolve()
+    if not checkpoint.is_file() or checkpoint.suffix.lower() not in CHECKPOINT_EXTENSIONS:
+        raise ValueError(f"Not a checkpoint file: {checkpoint}")
+    if root is None:
+        root = checkpoint.parent.parent if checkpoint.parent.name in ARTIFACT_FOLDERS else checkpoint.parent
+    if not checkpoint.is_relative_to(root):
+        raise ValueError("Checkpoint must be inside --root.")
+    print(f"Scanning {root} ...", flush=True)
+    report = analyze(root)
+    relative = checkpoint.relative_to(root).as_posix()
+    artifact = next((item for item in report.artifacts if item.path == relative), None)
+    if artifact is None:
+        raise ValueError("Checkpoint was excluded or unreadable; it was not analyzed.")
+    experiment = next(item for item in report.experiments if artifact.id in item.artifacts)
+    print(f"\nCheckpoint: {checkpoint}\nSize: {format_size(artifact.size)}")
+    print(f"Modified: {datetime.fromtimestamp(artifact.modified):%Y-%m-%d %H:%M:%S}")
+    print(f"Experiment: {experiment.path}")
+    print(f"Scan root: {root}")
+    if args.root is None:
+        print("Use --root DIRECTORY to include sources and experiments outside this folder.")
+    if experiment.kind == "checkpoint_candidate":
+        print("Run unknown: no reliable experiment metadata found.")
+    by_id = {item.id: item for item in report.experiments}
+    descriptions = {"derived_from": "recorded continuation", "references": "checkpoint/component use", "possible_derivation": "possible continuation"}
+    for heading, side in (("Sources", "target"), ("Used by", "source")):
+        related = [edge for edge in report.edges if edge.directed and getattr(edge, side) == experiment.id]
+        print(f"\n{heading}:")
+        if not related:
+            print("  No supported link found in this scan.")
+        for edge in related:
+            other = by_id[edge.source if side == "target" else edge.target]
+            print(f"  {other.path} ({descriptions[edge.kind]}, confidence {edge.confidence:.0%})")
+            for fact in edge.evidence:
+                if fact.get("artifact"):
+                    detail = f"component: {fact['component']}" if fact.get('component') else fact.get('field', '')
+                    print(f"    Evidence: {fact['artifact']}" + (f" | {detail}" if detail else ""))
+            for caveat in edge.caveats:
+                print(f"    {caveat}")
+    for reference in experiment.references:
+        if reference.get("resolution") in {"unresolved", "ambiguous"}:
+            print(f"  {reference['resolution'].capitalize()} source: {reference['value']}")
+    # These are run-level facts, not values read from the model's serialized state.
+    for heading, values in (("Run configuration", experiment.config), ("Run metrics", experiment.metrics)):
+        print(f"\n{heading}:")
+        visible = {key: value for key, value in values.items() if not any(word in key.lower() for word in ("sha256", "hash"))}
+        if not visible:
+            print("  Not found.")
+        core = {"model", "model_type", "architecture", "seed", "lr", "learning_rate", "batch_size", "epochs"}
+        keys = sorted(visible, key=lambda key: (not (key.rsplit('.', 1)[-1] in core if heading == "Run configuration" else 'best_' in key), key))
+        for key in keys if args.full else keys[:8]:
+            value = visible[key]
+            value = f"{value:.6g}" if isinstance(value, float) else json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+            print(f"  {key}: {value[:200]}" + ("..." if len(value) > 200 else ""))
+        if not args.full and len(keys) > 8:
+            print(f"  ... {len(keys) - 8} more fields; use --full to show all.")
+    if report.statistics["warnings"]:
+        print(f"\n{report.statistics['warnings']} reading/inference notes; some metadata may be unavailable.")
+    return 1 if report.statistics["partial"] else 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="run-shelf", description="Find experiments and trace their relationships.")
     parser.add_argument("--version", action="version", version=__version__)
@@ -79,7 +144,17 @@ def main(argv=None):
     listing.add_argument("directory", type=Path)
     listing.add_argument("--sort", choices=("name", "time", "size"), default="name", help="Name A-Z, newest first, or largest first")
     listing.add_argument("--name", default="", help="Filename contains this text (case-insensitive)")
+    inspect = commands.add_parser("inspect", help="Print checkpoint information, metadata, and sources")
+    inspect.add_argument("checkpoint", type=Path, help="Checkpoint file; relative to --root when provided")
+    inspect.add_argument("--root", type=Path, help="Scan this directory for related experiments (default: checkpoint's folder)")
+    inspect.add_argument("--full", action="store_true", help="Show all configuration and metric fields")
     args = parser.parse_args(argv)
+    if args.command == "inspect":
+        try:
+            return inspect_checkpoint(args)
+        except (OSError, ValueError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 2
     root = args.directory.expanduser().resolve()
     if not root.is_dir():
         parser.error(f"Directory does not exist or is not a folder: {root}")

@@ -26,10 +26,27 @@ const assert = require('node:assert/strict');
     await page.locator('#search').fill('');
     await page.locator('#graph-button').click();
     assert.equal(await page.locator('#global-graph .graph-node').count(), initial);
-    assert.equal(await page.locator('#global-graph .graph-edge').count(), report.edges.filter(edge => edge.directed).length);
-    await page.locator('#include-similar').check();
     assert.equal(await page.locator('#global-graph .graph-edge').count(), report.edges.length);
     await page.locator('#include-similar').uncheck();
+    assert.equal(await page.locator('#global-graph .graph-edge').count(), report.edges.filter(edge => edge.directed).length);
+    const routes = await page.locator('#global-graph .graph-edge').evaluateAll(nodes => nodes.map(node => node.getAttribute('d')));
+    assert(routes.every(route => !/NaN|undefined|Infinity/.test(route)));
+    assert.equal(new Set(routes).size, routes.length, 'Every relationship has its own route');
+    if (routes.length) assert.notEqual(await page.locator('#global-graph .graph-edge').first().evaluate(node => getComputedStyle(node).strokeDasharray), 'none');
+    const branching = report.experiments.find(item => report.edges.filter(edge => edge.directed && edge.source === item.id).length > 1);
+    if (branching) {
+      const starts = await page.locator(`#global-graph .graph-edge[data-source="${branching.id}"]`).evaluateAll(nodes => nodes.map(node => node.getAttribute('d').split(' C')[0]));
+      assert.equal(new Set(starts).size, starts.length, 'Outgoing links use separate attachment points');
+      await page.locator(`#global-graph .graph-node[data-id="${branching.id}"]`).hover();
+      assert.equal(await page.locator(`#global-graph .graph-edge.dimmed[data-source="${branching.id}"]`).count(), 0);
+      assert.equal(await page.locator(`#global-graph .graph-edge.highlighted[data-source="${branching.id}"]`).count(), starts.length);
+      assert.equal(await page.locator('#global-graph .graph-edge.highlighted').first().evaluate(node => getComputedStyle(node).strokeDasharray), 'none');
+      await page.locator('#graph-button').hover();
+      assert.equal(await page.locator('#global-graph .dimmed').count(), 0);
+      assert.equal(await page.locator('#global-graph .highlighted').count(), 0);
+    }
+    await page.locator('#include-similar').check();
+    assert.equal(await page.locator('#global-graph .graph-edge').count(), report.edges.length);
     await page.screenshot({ path: process.argv[3] });
     const selected = report.experiments.find(item => item.path === 'leaf') || report.experiments.find(item => report.edges.some(edge => edge.directed && edge.target === item.id)) || report.experiments[0];
     if (selected) {
@@ -54,6 +71,7 @@ const assert = require('node:assert/strict');
           }
         }
       }
+      for (const edge of report.edges) if (!edge.directed && [edge.source, edge.target].includes(selected.id)) expectedChain.add(edge.id);
       assert.deepEqual((await page.locator('#lineage-graph .graph-edge').evaluateAll(nodes => nodes.map(node => node.dataset.id))).sort(), [...expectedChain].sort());
       if (sourceIds.length) {
         await page.locator('#origin .relationship summary').first().click();
@@ -89,6 +107,8 @@ const assert = require('node:assert/strict');
     if (unknown) {
       await page.locator(`button[data-id="${unknown.id}"]`).click();
       assert((await page.locator('#origin').innerText()).includes('Origin unknown'));
+      const similarities = report.edges.filter(edge => !edge.directed && [edge.source, edge.target].includes(unknown.id));
+      for (const edge of similarities) assert.equal(await page.locator(`#lineage-graph .graph-edge[data-id="${edge.id}"]`).count(), 1);
       await page.locator('#back').click();
     }
     const unresolved = report.experiments.find(item => item.references.some(ref => ref.resolution === 'unresolved'));

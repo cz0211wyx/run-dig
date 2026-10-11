@@ -18,3 +18,9 @@ To list checkpoints in the terminal:
 ```sh
 run-shelf list ./experiments --sort size --name best
 ```
+
+Inspect one checkpoint in the terminal (`--root` includes other runs; `--full` shows all fields):
+
+```sh
+run-shelf inspect run-a/best.pt --root ./experiments
+```

@@ -55,6 +55,11 @@ summary { cursor: pointer; }
 .graph-viewport { overflow: auto; max-height: 620px; border: 1px solid #e5e7eb; background: #fafbfc; }
 .graph-viewport svg { display: block; }
 .graph-node { cursor: pointer; }
+.graph-edge { opacity: .32; stroke-dasharray: 4 5; transition: opacity .12s; }
+.graph-edge.secondary { opacity: .16; }
+.graph-edge.highlighted, .graph-edge:hover { opacity: 1; stroke-dasharray: none; stroke-width: 2.5; }
+.graph-edge.dimmed { opacity: .04; }
+.graph-node.dimmed { opacity: .3; }
 .graph-node:focus rect { stroke: #245f9b; stroke-width: 2; }
 .graph-match rect { fill: #fff4cb; stroke: #ad7c08; }
 .origin { margin: 18px 0; }
@@ -100,7 +105,7 @@ footer a { color: #245f9b; }
     </div>
     <p id="empty" class="empty" hidden>No matching experiments.</p>
     <div id="graph-view" hidden>
-      <label><input id="include-similar" type="checkbox"> Include similarity and identical files</label>
+      <label><input id="include-similar" type="checkbox" checked> Include similarity and identical files</label>
       <p id="graph-count" class="muted"></p>
       <div id="global-graph"></div>
     </div>
@@ -254,7 +259,7 @@ function relationshipList(parent, edges, id) {
     button.onclick = () => showExperiment(other.id);
     row.append(button);
     const fact = edge.evidence.find(item => item.artifact);
-    if (fact) row.append(element('div', `${fact.artifact}${fact.field ? ' · ' + fact.field : ''}`, 'path'));
+    if (fact) row.append(element('div', `${fact.artifact}${fact.component ? ' · component: ' + fact.component : fact.field ? ' · ' + fact.field : ''}`, 'path'));
     const details = element('details'); details.append(element('summary', 'Why this link?'));
     let rendered = false;
     details.ontoggle = () => { if (details.open && !rendered) { rendered = true; evidenceList(details, edge); } };
@@ -313,9 +318,9 @@ function showExperiment(id) {
     origin.append(row);
   }
   panel.append(origin);
-  const lineage = lineageFor(id);
+  const lineage = [...lineageFor(id), ...related.filter(edge => !edge.directed)];
   if (lineage.length) {
-    panel.append(element('h3', 'Source chain'));
+    panel.append(element('h3', 'Relationships'));
     const graph = element('div'); graph.id = 'lineage-graph'; panel.append(graph);
     const ids = new Set([id, ...lineage.flatMap(edge => [edge.source, edge.target])]);
     renderGraph(graph, experiments.filter(exp => ids.has(exp.id)), lineage, id);
@@ -390,22 +395,49 @@ function layoutGraph(nodes, edges) {
         if (!visited.has(next)) { visited.add(next); ranks.set(next, ranks.get(queue[i]) + 1); queue.push(next); }
       }
     }
-    const rows = new Map(), points = new Map();
+    const columns = new Map(), points = new Map();
     ids.sort((a, b) => byId.get(a).path.localeCompare(byId.get(b).path));
     for (const id of ids) {
-      const rank = ranks.get(id), row = rows.get(rank) || 0;
-      points.set(id, {x: rank * 290, y: row * 84}); rows.set(rank, row + 1);
+      const rank = ranks.get(id);
+      if (!columns.has(rank)) columns.set(rank, []);
+      columns.get(rank).push(id);
     }
-    return {points, width: Math.max(...ranks.values()) * 290 + 220, height: Math.max(...rows.values()) * 84};
+    // Order each column by its neighbors instead of by name, reducing crossings.
+    const levels = [...columns.keys()].sort((a, b) => a - b);
+    for (let sweep = 0; sweep < 6; sweep++) {
+      const order = new Map();
+      for (const column of columns.values()) column.forEach((id, i) => order.set(id, (i + .5) / column.length));
+      for (const level of sweep % 2 ? [...levels].reverse() : levels) {
+        const score = id => {
+          const neighbors = adjacency.get(id).filter(next => sweep % 2 ? ranks.get(next) > level : ranks.get(next) < level);
+          return neighbors.length ? neighbors.reduce((sum, next) => sum + order.get(next), 0) / neighbors.length : order.get(id);
+        };
+        columns.get(level).sort((a, b) => score(a) - score(b));
+        columns.get(level).forEach((id, i, column) => order.set(id, (i + .5) / column.length));
+      }
+    }
+    const routed = directed.filter(edge => ranks.get(edge.target) - ranks.get(edge.source) !== 1);
+    const top = routed.length * 12 + 12;
+    for (const rank of levels) {
+      let previous = top - 100;
+      columns.get(rank).forEach((id, i) => {
+        const parents = adjacency.get(id).filter(next => ranks.get(next) < rank && points.has(next));
+        const desired = parents.length ? parents.reduce((sum, next) => sum + points.get(next).y, 0) / parents.length : top + i * 100;
+        const y = Math.max(previous + 100, desired); previous = y;
+        points.set(id, {x: rank * 360, y});
+      });
+    }
+    return {points, routed, width: Math.max(...ranks.values()) * 360 + 260, height: Math.max(...[...points.values()].map(point => point.y)) + 100};
   });
   const width = Math.max(1060, ...boxes.map(box => box.width + 40));
-  const points = new Map(); let x = 20, y = 20, rowHeight = 0;
+  const points = new Map(), lanes = new Map(); let x = 20, y = 20, rowHeight = 0;
   for (const box of boxes) {
     if (x + box.width > width - 20) { x = 20; y += rowHeight + 36; rowHeight = 0; }
     for (const [id, point] of box.points) points.set(id, {x: x + point.x, y: y + point.y});
+    box.routed.forEach((edge, i) => lanes.set(edge.id, y + 6 + i * 12));
     x += box.width + 40; rowHeight = Math.max(rowHeight, box.height);
   }
-  return {points, width, height: Math.max(100, y + rowHeight + 20)};
+  return {points, lanes, width, height: Math.max(100, y + rowHeight + 20)};
 }
 
 function renderGraph(parent, nodes, edges, selectedId = null) {
@@ -417,21 +449,38 @@ function renderGraph(parent, nodes, edges, selectedId = null) {
     for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
     return node;
   };
-  const {points, width, height} = layoutGraph(nodes, edges);
-  const svg = svgNode('svg', {viewBox: `0 0 ${width} ${height}`, role: 'group', 'aria-label': selectedId ? 'Experiment source chain' : 'All experiments graph'});
+  const {points, lanes, width, height} = layoutGraph(nodes, edges);
+  const svg = svgNode('svg', {viewBox: `0 0 ${width} ${height}`, role: 'group', 'aria-label': selectedId ? 'Experiment relationships' : 'All experiments graph'});
   const arrowId = selectedId ? 'lineage-arrow' : 'global-arrow';
   const defs = svgNode('defs'), marker = svgNode('marker', {id: arrowId, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto'});
   marker.append(svgNode('path', {d: 'M0,0 L10,5 L0,10 z', fill: '#758493'})); defs.append(marker); svg.append(defs);
   const labels = {derived_from: 'continues', references: 'checkpoint use', same_artifact: 'identical file', possible_derivation: 'possible continuation', similar_to: 'similar'};
+  const ports = new Map(), endpoints = new Map();
+  for (const edge of edges) {
+    const a = points.get(edge.source), b = points.get(edge.target);
+    const sides = b.x > a.x ? ['right', 'left'] : b.x < a.x ? ['left', 'right'] : ['right', 'right'];
+    [edge.source, edge.target].forEach((id, index) => {
+      const key = `${id}:${sides[index]}`;
+      if (!ports.has(key)) ports.set(key, []);
+      ports.get(key).push({edge, index, side: sides[index], point: points.get(id), other: index ? a : b});
+    });
+  }
+  for (const entries of ports.values()) {
+    entries.sort((a, b) => a.other.y - b.other.y || a.other.x - b.other.x || a.edge.id.localeCompare(b.edge.id));
+    entries.forEach((entry, i) => endpoints.set(`${entry.edge.id}:${entry.index}`, {
+      x: entry.point.x + (entry.side === 'right' ? 220 : 0), y: entry.point.y + 8 + 40 * (i + 1) / (entries.length + 1),
+      sign: entry.side === 'right' ? 1 : -1, track: 16 + 44 * (i + 1) / (entries.length + 1)
+    }));
+  }
   // Paint similarity first so recorded sources stay visible above it.
   [...edges].sort((a, b) => Number(a.directed) - Number(b.directed)).forEach(edge => {
-    const a = points.get(edge.source), b = points.get(edge.target);
-    const forward = b.x > a.x, sameColumn = a.x === b.x;
-    const x1 = a.x + (forward || sameColumn ? 220 : 0), x2 = b.x + (forward ? 0 : 220);
-    const middle = sameColumn ? x1 + 35 : (x1 + x2) / 2;
+    const a = endpoints.get(`${edge.id}:0`), b = endpoints.get(`${edge.id}:1`);
+    const lane = lanes.get(edge.id), bend = Math.max(40, Math.abs(b.x - a.x) * .45);
+    const route = lane === undefined
+      ? `M${a.x},${a.y} C${a.x + a.sign * bend},${a.y} ${b.x + b.sign * bend},${b.y} ${b.x},${b.y}`
+      : `M${a.x},${a.y} C${a.x + a.sign * a.track},${a.y} ${a.x + a.sign * a.track},${lane} ${a.x + a.sign * (a.track + 8)},${lane} L${b.x + b.sign * (b.track + 8)},${lane} C${b.x + b.sign * b.track},${lane} ${b.x + b.sign * b.track},${b.y} ${b.x},${b.y}`;
     const tentative = edge.kind === 'possible_derivation';
-    const line = svgNode('path', {d: `M${x1},${a.y + 28} C${middle},${a.y + 28} ${middle},${b.y + 28} ${x2},${b.y + 28}`, fill: 'none', stroke: tentative ? '#af7a28' : edge.directed ? '#527c9d' : '#c5cdd4', 'stroke-width': edge.directed ? 1.8 : 1, class: 'graph-edge', 'data-id': edge.id});
-    if (tentative) line.setAttribute('stroke-dasharray', '5 4');
+    const line = svgNode('path', {d: route, fill: 'none', stroke: tentative ? '#af7a28' : edge.directed ? '#527c9d' : '#a0acb8', 'stroke-width': edge.directed ? 1.8 : 1, class: edge.directed ? 'graph-edge' : 'graph-edge secondary', 'data-id': edge.id, 'data-source': edge.source, 'data-target': edge.target});
     if (edge.directed) line.setAttribute('marker-end', `url(#${arrowId})`);
     const title = svgNode('title'); title.textContent = `${labels[edge.kind]} · ${Math.round(edge.confidence * 100)}% confidence`;
     line.append(title); svg.append(line);
@@ -447,6 +496,18 @@ function renderGraph(parent, nodes, edges, selectedId = null) {
     hint.textContent = item.path.length > 32 ? '…' + item.path.slice(-30) : item.path;
     group.append(name, hint);
     group.onclick = () => showExperiment(item.id);
+    const highlight = active => {
+      const neighbors = new Set([item.id]);
+      for (const line of svg.querySelectorAll('.graph-edge')) {
+        const connected = line.dataset.source === item.id || line.dataset.target === item.id;
+        line.classList.toggle('dimmed', active && !connected);
+        line.classList.toggle('highlighted', active && connected);
+        if (connected) { neighbors.add(line.dataset.source); neighbors.add(line.dataset.target); }
+      }
+      for (const node of svg.querySelectorAll('.graph-node')) node.classList.toggle('dimmed', active && !neighbors.has(node.dataset.id));
+    };
+    group.onmouseenter = group.onfocus = () => highlight(true);
+    group.onmouseleave = group.onblur = () => highlight(false);
     group.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showExperiment(item.id); } };
     svg.append(group);
   }
@@ -463,7 +524,7 @@ function renderGraph(parent, nodes, edges, selectedId = null) {
   }
   toolbar.append(zoom); parent.append(toolbar);
   wrap.append(svg); parent.append(wrap); resize(1);
-  parent.append(element('p', 'Arrows: source → experiment using it. Dashed arrows: possible continuation. Gray lines: similarity or identical files. Scroll to explore; click a node for evidence.', 'path'));
+  parent.append(element('p', 'Hover a node to highlight its connections; click for evidence. Arrows: source → experiment using it. Amber: uncertain. Gray: similarity or identical files.', 'path'));
 }
 
 function showOverview(view) {
