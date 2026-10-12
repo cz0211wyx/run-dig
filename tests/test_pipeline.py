@@ -10,9 +10,9 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from runshelf.cli import main
-from runshelf.scan import analyze
-from runshelf.report import write_report
+from rundig.cli import main
+from rundig.scan import analyze
+from rundig.report import write_report
 
 
 class PipelineTests(unittest.TestCase):
@@ -81,8 +81,8 @@ class PipelineTests(unittest.TestCase):
     def test_npz_inspection_limit_is_reported(self):
         self.npz("run/best.npz")
         self.npz("unknown.npz")
-        with patch("runshelf.scan.NPZ_INSPECTION_LIMIT", 1):
-            with patch("runshelf.scan.zipfile.ZipFile", side_effect=AssertionError("Oversized archive opened")):
+        with patch("rundig.scan.NPZ_INSPECTION_LIMIT", 1):
+            with patch("rundig.scan.zipfile.ZipFile", side_effect=AssertionError("Oversized archive opened")):
                 report = self.report(hash_limit=0)
         self.assertEqual(report.statistics["checkpoints"], 1)
         self.assertEqual(len(report.warnings), 2)
@@ -519,8 +519,8 @@ class PipelineTests(unittest.TestCase):
                 self.assertTrue(all(record['confidence'] == .4 for record in records))
 
     def test_metric_record_limit_does_not_imply_final_epoch(self):
-        from runshelf.metadata import extract, checkpoint_metrics
-        from runshelf.models import Artifact
+        from rundig.metadata import extract, checkpoint_metrics
+        from rundig.models import Artifact
         self.put('history.jsonl', '{"epoch":1,"loss":2}\n{"epoch":2,"loss":1}\n{"epoch":3,"loss":0}\n')
         history = Artifact('history', 'history.jsonl', 'metrics', 0, 0)
         checkpoint = Artifact('cp', 'last.pt', 'checkpoint', 0, 0)
@@ -959,6 +959,19 @@ class PipelineTests(unittest.TestCase):
             write_report(self.report(), output)
         self.assertEqual((output / "index.html").read_text(), "keep me")
 
+    def test_legacy_report_directory_can_be_updated_after_rename(self):
+        self.run_folder('run')
+        output = self.root / 'report'
+        self.put('report/.run-shelf-output', 'run-shelf report schema 1.0\n')
+        self.put('report/index.html', 'old report')
+        report = self.report(output=output)
+        page = write_report(report, output)
+        self.assertTrue((output / '.run-dig-output').is_file())
+        self.assertIn('<title>run-dig</title>', page.read_text(encoding='utf-8'))
+        self.assertEqual(json.loads((output / 'report.json').read_text(encoding='utf-8')), report.to_dict())
+        # Updating an already-renamed report remains valid too.
+        write_report(report, output)
+
     def test_hash_budget_and_excludes(self):
         self.put("a.pt", b"1234")
         self.put("b.pt", b"1234")
@@ -987,7 +1000,7 @@ class PipelineTests(unittest.TestCase):
         def failing_walk(root, followlinks=False, onerror=None):
             onerror(PermissionError(13, 'permission denied', str(root / 'private')))
             return iter([])
-        with patch('runshelf.scan.os.walk', failing_walk):
+        with patch('rundig.scan.os.walk', failing_walk):
             report = self.report()
         self.assertTrue(report.statistics['partial'])
         self.assertEqual(report.warnings[0]['kind'], 'read_error')
@@ -1160,10 +1173,20 @@ class PipelineTests(unittest.TestCase):
     def test_cli_end_to_end(self):
         self.run_folder("run")
         output = self.root / "report"
-        result = subprocess.run([sys.executable, "-m", "runshelf", "scan", str(self.root), "-o", str(output)], capture_output=True, text=True)
+        result = subprocess.run([sys.executable, "-m", "rundig", "scan", str(self.root), "-o", str(output)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((output / "index.html").is_file())
         self.assertIn("Found 1 checkpoints", result.stdout)
+
+    def test_renamed_module_runs_outside_checkout_with_default_output(self):
+        self.run_folder('run')
+        result = subprocess.run([sys.executable, '-m', 'rundig', 'scan', '.'], cwd=self.root,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = self.root / 'run-dig-report'
+        self.assertTrue((output / '.run-dig-output').is_file())
+        self.assertIn('<title>run-dig</title>', (output / 'index.html').read_text(encoding='utf-8'))
+        self.assertFalse((self.root / 'run-shelf-report').exists())
 
 
 if __name__ == "__main__":

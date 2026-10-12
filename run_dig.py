@@ -1,8 +1,8 @@
-"""Support the original `python run_shelf.py DIRECTORY` command."""
+"""Support the original `python run_dig.py DIRECTORY` command."""
 
 import sys
 
-from runshelf.cli import format_size, main
+from rundig.cli import format_size, main
 
 
 if __name__ == "__main__":

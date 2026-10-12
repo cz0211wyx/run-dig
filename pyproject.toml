@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "run-shelf"
+name = "run-dig"
 version = "0.2.0"
 description = "Find experiments and trace their relationships."
 readme = "README.md"
@@ -12,10 +12,10 @@ license = {text = "MIT"}
 dependencies = ["PyYAML>=6.0"]
 
 [project.scripts]
-run-shelf = "runshelf.cli:main"
+run-dig = "rundig.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["runshelf*"]
+include = ["rundig*"]
 
 [tool.setuptools.package-data]
-runshelf = ["viewer.html"]
+rundig = ["viewer.html"]

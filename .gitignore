@@ -12,5 +12,6 @@ build/
 dist/
 .pytest_cache/
 /reports/
+/run-dig-report/
 /run-shelf-report/
 /demo-experiments/

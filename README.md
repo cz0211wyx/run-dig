@@ -1,39 +1,63 @@
-# run-shelf
+# run-dig
 
 Scan messy ML folders to find checkpoints, recover experiment metadata, and trace possible relationships.
 
-Python 3.10+.
-
-Supports `.pt`, `.pth`, `.ckpt`, `.safetensors`, and model `.npz` archives.
-NPZ recognition uses array names and checkpoint naming conventions; feature caches
-are skipped. Arrays are never loaded, and recognition does not verify model validity.
+Requires Python 3.10+ and Git.
 
 ```sh
-python -m pip install -e .
-run-shelf scan ./experiments --open
+pip install git+https://github.com/cz0211wyx/run-dig.git
+run-dig scan ./experiments --open
 ```
 
-Switch between the experiment list and the full graph. Hover a node to highlight
-its links; arrows indicate sources, and undirected lines indicate similarity. Click an experiment to see
-its sources, downstream experiments, and files. Parent collections show their child
-runs and total checkpoints; similarity links explain recorded differences, not ancestry.
-Results are saved to `run-shelf-report/index.html` and `report.json`.
+Opens a local HTML report and saves `run-dig-report/index.html` and `report.json`.
+Hover a graph node to highlight its links; click to see its files, metadata, and
+relationship evidence. Arrows show recorded or possible sources; undirected links
+show similarity or identical files.
 
-To list checkpoints in the terminal:
+![Demo HTML report with an experiment and its relationships highlighted](examples/report-preview.png)
+
+*Example report using demo data, with one experiment highlighted.*
+
+Supports `.pt`, `.pth`, `.ckpt`, `.safetensors`, and model `.npz` files.
+NPZ detection uses array names and file context to distinguish models from feature
+caches; it does not verify model validity. Arrays are never loaded.
+
+Use the terminal to list, inspect, or compare checkpoints:
 
 ```sh
-run-shelf list ./experiments --sort size --name best
+run-dig list ./experiments --sort size --name best
+run-dig inspect run-a/best.pt --root ./experiments
+run-dig compare run-a/best.pt run-b/best.pt --root ./experiments
 ```
 
-Inspect one checkpoint in the terminal (`--root` includes other runs; `--full` shows all fields):
+`--root` includes related runs; `--full` shows all fields for inspect and compare.
+Scanning is read-only. Checkpoints and scripts are never executed.
+
+Relationships and checkpoint metrics include evidence and confidence. Similarity
+does not prove ancestry, and confidence is not a calibrated probability. Missing or
+conflicting settings remain unknown; conflicting values keep their sources.
+
+## Examples and tests
+
+After installing, run these from a repository checkout:
 
 ```sh
-run-shelf inspect run-a/best.pt --root ./experiments
-run-shelf compare run-a/best.pt run-b/best.pt --root ./experiments
+python -m unittest discover -s tests
+python examples/create_demo.py
+python -m rundig scan demo-experiments --open
 ```
 
-Checkpoint metrics include their source and confidence. Filename-based matches are
-estimates; run summaries are shown separately. Model files are never loaded.
-Conflicting records keep their values and sources. Similarity uses recorded settings
-and available code snapshots; missing code lowers confidence. Missing or conflicting
-settings remain unknown rather than being reported as differences.
+The demo uses placeholder weights and finds **7 checkpoints**. Covered test cases:
+
+| Case | Result |
+| --- | --- |
+| Explicit `resume_from` path | Source link with the recorded file as evidence. |
+| Matching settings, different recorded seeds | Similarity, without claiming inheritance. |
+| Copied checkpoint with a different name | Identical-file link; copy direction stays unknown. |
+| Missing or conflicting config | Unknown fields, with available values and sources retained. |
+| Separate histories with an explicit resume boundary | `last` uses the continuation; overlapping histories stay ambiguous. |
+
+Validated on Windows, 2026-10-12: **108 tests passed, 1 skipped** (symbolic-link
+permissions). Local scans found **128 checkpoints** in a synthetic experiment
+folder and **353** in a research archive. Both HTML reports passed browser checks.
+These datasets are not bundled; scan counts are not lineage-accuracy measurements.

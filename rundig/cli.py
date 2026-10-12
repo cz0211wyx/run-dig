@@ -271,12 +271,12 @@ def compare_checkpoints(args):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="run-shelf", description="Find experiments and trace their relationships.")
+    parser = argparse.ArgumentParser(prog="run-dig", description="Find experiments and trace their relationships.")
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     scan = commands.add_parser("scan", help="Analyze a folder and create a browser report")
     scan.add_argument("directory", type=Path)
-    scan.add_argument("--output", "-o", type=Path, default=Path("run-shelf-report"), help="Report folder (default: run-shelf-report)")
+    scan.add_argument("--output", "-o", type=Path, default=Path("run-dig-report"), help="Report folder (default: run-dig-report)")
     scan.add_argument("--exclude", action="append", default=[], metavar="GLOB", help="Skip a folder or path pattern; repeatable")
     scan.add_argument("--open", action="store_true", help="Open the report in your browser")
     listing = commands.add_parser("list", help="List checkpoints in the terminal")

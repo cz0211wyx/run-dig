@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>run-shelf</title>
+<title>run-dig</title>
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; color: #24292f; background: #fff; font: 14px/1.6 system-ui, sans-serif; }
@@ -89,7 +89,7 @@ footer a { color: #245f9b; }
 <body>
 <main>
   <header>
-    <h1>run-shelf</h1>
+    <h1>run-dig</h1>
     <div id="scan-summary"></div>
     <div id="root" class="path"></div>
     <p id="partial" class="notice" hidden>Some files could not be scanned. See scan notes below.</p>
@@ -123,7 +123,7 @@ footer a { color: #245f9b; }
     <div id="experiment-detail"></div>
   </section>
   <footer>
-    <a id="download" href="report.json" download="run-shelf-report.json">Download JSON</a>
+    <a id="download" href="report.json" download="run-dig-report.json">Download JSON</a>
     <details id="notes"><summary id="notes-label">Scan notes</summary><div id="scan-notes"></div></details>
   </footer>
 </main>
@@ -788,7 +788,7 @@ $('include-similar').onchange = () => $('global-graph').querySelector('svg')?.cl
 $('download').onclick = event => {
   event.preventDefault();
   const url = URL.createObjectURL(new Blob([JSON.stringify(REPORT, null, 2)], {type: 'application/json'}));
-  const link = element('a'); link.href = url; link.download = 'run-shelf-report.json'; link.click();
+  const link = element('a'); link.href = url; link.download = 'run-dig-report.json'; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 $('back').onclick = () => {

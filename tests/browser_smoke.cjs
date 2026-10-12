@@ -1,5 +1,5 @@
 // Optional: node tests/browser_smoke.cjs REPORT_HTML SCREENSHOT.png
-const { chromium } = require(process.env.RUN_SHELF_PLAYWRIGHT || 'playwright');
+const { chromium } = require(process.env.RUN_DIG_PLAYWRIGHT || 'playwright');
 const { pathToFileURL } = require('node:url');
 const { readFileSync } = require('node:fs');
 const path = require('node:path');
@@ -66,7 +66,7 @@ async function checkMetadataTable(details, values, sources) {
 (async () => {
   const reportPath = path.resolve(process.argv[2]);
   const report = JSON.parse(readFileSync(path.join(path.dirname(reportPath), 'report.json'), 'utf8'));
-  const browser = await chromium.launch({ headless: true, executablePath: process.env.RUN_SHELF_BROWSER || undefined });
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.RUN_DIG_BROWSER || undefined });
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
     const errors = [], remoteRequests = [];
@@ -301,7 +301,7 @@ async function checkMetadataTable(details, values, sources) {
     await page.locator('#scan-notes p').first().waitFor();
     const download = page.waitForEvent('download');
     await page.getByText('Download JSON', { exact: true }).click();
-    assert.equal((await download).suggestedFilename(), 'run-shelf-report.json');
+    assert.equal((await download).suggestedFilename(), 'run-dig-report.json');
     await page.setViewportSize({ width: 390, height: 844 });
     assert(await page.locator('#search').isVisible());
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
