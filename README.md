@@ -2,10 +2,10 @@
 
 Scan messy ML folders to find checkpoints, recover experiment metadata, and trace possible relationships.
 
-Requires Python 3.10+.
+Requires Python 3.10+ and Git.
 
 ```sh
-pip install run-dig
+pip install git+https://github.com/cz0211wyx/run-dig.git
 run-dig scan ./experiments --open
 ```
 
