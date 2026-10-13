@@ -14,6 +14,10 @@ dependencies = ["PyYAML>=6.0"]
 [project.scripts]
 run-dig = "rundig.cli:main"
 
+[project.urls]
+Repository = "https://github.com/cz0211wyx/run-dig"
+Issues = "https://github.com/cz0211wyx/run-dig/issues"
+
 [tool.setuptools.packages.find]
 include = ["rundig*"]
 

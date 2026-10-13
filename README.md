@@ -2,10 +2,10 @@
 
 Scan messy ML folders to find checkpoints, recover experiment metadata, and trace possible relationships.
 
-Requires Python 3.10+ and Git.
+Requires Python 3.10+.
 
 ```sh
-pip install git+https://github.com/cz0211wyx/run-dig.git
+pip install run-dig
 run-dig scan ./experiments --open
 ```
 
@@ -14,7 +14,7 @@ Hover a graph node to highlight its links; click to see its files, metadata, and
 relationship evidence. Arrows show recorded or possible sources; undirected links
 show similarity or identical files.
 
-![Demo HTML report with an experiment and its relationships highlighted](examples/report-preview.png)
+![Demo HTML report with an experiment and its relationships highlighted](https://raw.githubusercontent.com/cz0211wyx/run-dig/main/examples/report-preview.png)
 
 *Example report using demo data, with one experiment highlighted.*
 
