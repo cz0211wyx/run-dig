@@ -307,8 +307,16 @@ async function checkMetadataTable(details, values, sources) {
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
     await page.locator('#graph-button').click();
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+    await page.goto(pathToFileURL(reportPath).href + '#graph');
+    assert(await page.locator('#graph-view').isVisible(), 'Demo links open the full graph directly');
+    assert(await page.locator('#list-view').isHidden());
+    assert.equal(await page.locator('#global-graph .graph-node').count(), initial);
+    await page.locator('#global-graph .graph-node').first().click();
+    assert(await page.locator('#detail').isVisible());
+    await page.locator('#back').click();
+    assert(await page.locator('#graph-view').isVisible());
     assert.deepEqual(errors, []);
     assert.deepEqual(remoteRequests, []);
-    console.log(JSON.stringify({ experiments: initial, list: 'passed', search: 'passed', sources: 'passed', fullGraph: 'passed', metadataColumns: 'passed', download: 'passed', mobile: 'passed', errors }));
+    console.log(JSON.stringify({ experiments: initial, list: 'passed', search: 'passed', sources: 'passed', fullGraph: 'passed', metadataColumns: 'passed', download: 'passed', mobile: 'passed', graphLink: 'passed', errors }));
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

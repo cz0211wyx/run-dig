@@ -14,9 +14,9 @@ Hover a graph node to highlight its links; click to see its files, metadata, and
 relationship evidence. Arrows show recorded or possible sources; undirected links
 show similarity or identical files.
 
-![Demo HTML report with an experiment and its relationships highlighted](https://raw.githubusercontent.com/cz0211wyx/run-dig/main/examples/report-preview.png)
+[![Try the interactive demo](https://raw.githubusercontent.com/cz0211wyx/run-dig/main/examples/report-preview.png)](https://cz0211wyx.github.io/run-dig/#graph)
 
-*Example report using demo data, with one experiment highlighted.*
+[Try the interactive demo](https://cz0211wyx.github.io/run-dig/#graph) — explore sample experiments in your browser, no installation needed.
 
 Supports `.pt`, `.pth`, `.ckpt`, `.safetensors`, and model `.npz` files.
 NPZ detection uses array names and file context to distinguish models from feature

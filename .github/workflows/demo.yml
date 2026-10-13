@@ -1,0 +1,43 @@
+name: demo
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/demo.yml'
+      - 'examples/create_demo.py'
+      - 'rundig/**'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/configure-pages@v5
+      - run: python -m pip install .
+      - name: Generate the sample report
+        run: |
+          python examples/create_demo.py
+          run-dig scan demo-experiments -o reports/demo
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: reports/demo
+      - id: deployment
+        uses: actions/deploy-pages@v4
