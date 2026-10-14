@@ -83,7 +83,7 @@ def list_checkpoints(args):
     return 1 if errors else 0
 
 
-def load_checkpoints(paths, root=None):
+def load_checkpoints(paths, root=None, *, git=True):
     root = root.expanduser().resolve() if root else None
     checkpoints = []
     for path in paths:
@@ -100,7 +100,7 @@ def load_checkpoints(paths, root=None):
     if any(not checkpoint.is_relative_to(root) for checkpoint in checkpoints):
         raise ValueError("Checkpoints must be inside --root.")
     print(f"Scanning {root} ...", flush=True)
-    report = analyze(root)
+    report = analyze(root, git=git)
     artifacts = {item.path: item for item in report.artifacts if item.kind == "checkpoint"}
     owners = {key: item for item in report.experiments for key in item.artifacts}
     result = []
@@ -132,8 +132,36 @@ def print_checkpoint_metrics(artifact, full=False):
             print(f"    ... {len(keys) - 8} more fields; use --full to show all.")
 
 
+def print_git(experiment):
+    data = experiment.git
+    if not data:
+        return
+    print("\nGit:")
+    for record in data.get("recorded_commits", []):
+        revision = record.get("commit", str(record["value"]))[:12]
+        print(f"  Recorded: {revision} ({record['resolution']}) | {record['artifact']}#{record['field']}")
+        if record.get("summary"):
+            print(f"    {record['summary']}")
+    if not data.get("recorded_commits"):
+        print("  Training commit: unknown (not recorded).")
+    if data.get("repository") is not None:
+        print(f"  Repository: {data['repository']} (relative to scan root)")
+        head = data.get("head")
+        if head:
+            print(f"  Current checkout: {data.get('branch') or 'detached HEAD'} @ {head['commit'][:12]}")
+        print("  Recent repository commits (not linked to this run):" if data.get('history_scope') == 'repository'
+              else "  Recent commits touching this run's files:")
+        for entry in data.get("history", []):
+            date = datetime.fromtimestamp(entry['date']).strftime('%Y-%m-%d')
+            print(f"    {date}  {entry['commit'][:12]}  {entry['summary']}")
+        if not data.get("history"):
+            print("    None found in the inspected history.")
+    for note in data.get("notes", []):
+        print(f"  Note: {note}")
+
+
 def inspect_checkpoint(args):
-    report, [(checkpoint, artifact, experiment)] = load_checkpoints([args.checkpoint], args.root)
+    report, [(checkpoint, artifact, experiment)] = load_checkpoints([args.checkpoint], args.root, git=not args.no_git)
     print(f"\nCheckpoint: {checkpoint}\nSize: {format_size(artifact.size)}")
     print(f"Modified: {datetime.fromtimestamp(artifact.modified):%Y-%m-%d %H:%M:%S}")
     print(f"Experiment: {experiment.path}")
@@ -162,6 +190,8 @@ def inspect_checkpoint(args):
             if edge.description:
                 print(f"    {edge.description}")
             for fact in edge.evidence:
+                if fact['signal'] == 'recorded Git versions':
+                    print(f"    Git: {fact['value']} ({fact['source_commit'][:12]} / {fact['target_commit'][:12]})")
                 if fact.get("artifact"):
                     detail = f"component: {fact['component']}" if fact.get('component') else fact.get('field', '')
                     print(f"    Evidence: {fact['artifact']}" + (f" | {detail}" if detail else ""))
@@ -170,6 +200,7 @@ def inspect_checkpoint(args):
     for reference in experiment.references:
         if reference.get("resolution") in {"unresolved", "ambiguous"}:
             print(f"  {reference['resolution'].capitalize()} source: {reference['value']}")
+    print_git(experiment)
     print_checkpoint_metrics(artifact, args.full)
     # Run summaries remain useful context, but must not be mistaken for this file.
     for heading, values in (("Run configuration", experiment.config), ("Run metrics", experiment.metrics)):
@@ -197,10 +228,11 @@ def inspect_checkpoint(args):
 
 
 def compare_checkpoints(args):
-    report, entries = load_checkpoints([args.first, args.second], args.root)
+    report, entries = load_checkpoints([args.first, args.second], args.root, git=not args.no_git)
     for label, (path, artifact, experiment) in zip("AB", entries):
         print(f"{label}: {path} ({format_size(artifact.size)})")
         print(f"   Experiment: {experiment.path}")
+        print_git(experiment)
     left, right = entries[0][2], entries[1][2]
     print("\nRun relationship:")
     relations = [edge for edge in report.edges if {edge.source, edge.target} == {left.id, right.id}]
@@ -213,6 +245,9 @@ def compare_checkpoints(args):
         print(f"  {direction}: {edge.kind.replace('_', ' ')} (confidence {edge.confidence:.0%})")
         if edge.description:
             print(f"    {edge.description}")
+        for fact in edge.evidence:
+            if fact['signal'] == 'recorded Git versions':
+                print(f"    Git ({direction}): {fact['value']}")
         for caveat in edge.caveats:
             print(f"    {caveat}")
 
@@ -292,6 +327,8 @@ def main(argv=None):
     compare.add_argument("second", type=Path)
     compare.add_argument("--root", type=Path, help="Scan directory; checkpoint paths are relative to it (default: common parent)")
     compare.add_argument("--full", action="store_true", help="Show every field and longer values")
+    for command in (scan, inspect, compare):
+        command.add_argument("--no-git", action="store_true", help="Skip local Git history")
     args = parser.parse_args(argv)
     if args.command in {"inspect", "compare"}:
         try:
@@ -308,7 +345,7 @@ def main(argv=None):
     try:
         validate_output(output)
         print(f"Scanning {root} ...", flush=True)
-        report = analyze(root, output=output, excludes=args.exclude)
+        report = analyze(root, output=output, excludes=args.exclude, git=not args.no_git)
         html = write_report(report, output)
     except (OSError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)

@@ -276,6 +276,7 @@ function evidenceList(parent, edge) {
     const line = element('li', fact.signal);
     if (fact.artifact) line.append(element('div', `${fact.artifact}${fact.field ? ' · ' + fact.field : ''}`, 'path'));
     if (fact.value) line.append(element('div', String(fact.value), 'path'));
+    if (fact.source_commit) line.append(element('div', `${fact.source_commit.slice(0, 12)} / ${fact.target_commit.slice(0, 12)} (code history only)`, 'path'));
     if (fact.matched_fields?.length) line.append(element('div', `Matching fields: ${fact.matched_fields.join(', ')}`, 'path'));
     if (fact.artifacts?.length) line.append(element('div', fact.artifacts.join(', '), 'path'));
     if (fact.matched_artifacts?.length) line.append(element('div', `Matched file: ${fact.matched_artifacts.join(', ')}`, 'path'));
@@ -296,6 +297,32 @@ function evidenceList(parent, edge) {
     }
     table.append(body); const wrap = element('div', undefined, 'table-wrap'); wrap.append(table); parent.append(wrap);
   }
+}
+
+function gitDetails(parent, data) {
+  const records = data.recorded_commits || [];
+  parent.append(element('p', records.length ? 'Commits recorded in run files:' : 'Training commit: unknown (not recorded).', 'muted'));
+  for (const record of records) {
+    const revision = String(record.commit || record.value).slice(0, 12);
+    parent.append(element('div', `${revision} (${record.resolution})${record.summary ? ' · ' + record.summary : ''}`));
+    parent.append(element('p', `${record.artifact}#${record.field}`, 'path'));
+  }
+  if (data.repository != null) {
+    parent.append(element('p', `Repository: ${data.repository} (relative to scan root)`, 'path'));
+    if (data.head) parent.append(element('p', `Current checkout: ${data.branch || 'detached HEAD'} @ ${data.head.commit.slice(0, 12)}`));
+    parent.append(element('p', data.history_scope === 'repository' ? 'Recent repository commits (not linked to this run):' : "Recent commits touching this run's files:", 'muted'));
+    const table = element('table'), head = element('tr'), body = element('tbody');
+    for (const label of ['Commit', 'Message', 'Date']) head.append(element('th', label));
+    const thead = element('thead'); thead.append(head); table.append(thead);
+    for (const entry of data.history || []) {
+      const row = element('tr');
+      row.append(element('td', entry.commit.slice(0, 12), 'path'), element('td', entry.summary, 'path'), element('td', modified(entry.date), 'date'));
+      body.append(row);
+    }
+    table.append(body); const wrap = element('div', undefined, 'table-wrap'); wrap.append(table); parent.append(wrap);
+    if (!data.history?.length) parent.append(element('p', 'None found in the inspected history.', 'muted'));
+  }
+  for (const note of data.notes || []) parent.append(element('p', note, 'muted'));
 }
 
 function relationshipList(parent, edges, id) {
@@ -408,6 +435,7 @@ function showExperiment(id) {
     fileTable(panel, members.filter(file => file.kind === 'checkpoint'));
   }
   if (Object.keys(item.config).length) fold(panel, `Configuration (${Object.keys(item.config).length})`, parent => valueTable(parent, item.config, item.config_sources));
+  if (Object.keys(item.git || {}).length) fold(panel, 'Git history', parent => gitDetails(parent, item.git));
   if (Object.keys(item.metrics).length) fold(panel, `Metrics (${Object.keys(item.metrics).length})`, parent => {
     parent.append(element('p', 'Run summaries / last parsed log values; not necessarily a particular checkpoint.', 'muted'));
     valueTable(parent, item.metrics, item.metric_sources);

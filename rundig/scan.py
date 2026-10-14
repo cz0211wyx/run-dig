@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .metadata import ARTIFACT_FOLDERS, extract, identify
 from .lineage import infer
+from .git_history import attach_git
 from .models import Artifact, Report, stable_id
 
 CHECKPOINT_EXTENSIONS = {".pt", ".pth", ".ckpt", ".safetensors", ".npz"}
@@ -168,7 +169,7 @@ ASSUMPTIONS = [
 
 def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=64_000_000,
             hash_budget=512_000_000, max_files=100_000, similarity_threshold=.6,
-            max_pairs=200_000):
+            max_pairs=200_000, git=True):
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"Not a readable directory: {root}")
@@ -187,6 +188,8 @@ def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=
     edges, inference_warnings = infer(experiments, artifacts, ownership, similarity_threshold=similarity_threshold,
                                        max_pairs=max_pairs)
     warnings.extend(inference_warnings)
+    if git:
+        warnings.extend(attach_git(root, experiments, artifacts, edges))
     statistics.update({
         "artifacts": len(artifacts), "artifact_kinds": dict(Counter(item.kind for item in artifacts)),
         "experiments": len(experiments), "anchored_experiments": sum(item.kind == "experiment" for item in experiments),
@@ -203,6 +206,6 @@ def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=
     options = {"excludes": sorted(DEFAULT_EXCLUDES) + list(excludes), "text_limit_bytes": text_limit,
                "checkpoint_hash_limit_bytes": hash_limit, "checkpoint_hash_budget_bytes": hash_budget,
                "max_files": max_files, "similarity_threshold": similarity_threshold,
-               "max_pairs": max_pairs}
+               "max_pairs": max_pairs, "git": git}
     return Report("1.0", __version__, str(root), datetime.now(timezone.utc).isoformat(), options,
                   statistics, experiments, edges, artifacts, warnings, ASSUMPTIONS)

@@ -49,6 +49,7 @@ class Experiment:
     started: float | None = None
     finished: float | None = None
     time_sources: list[dict] = field(default_factory=list)
+    git: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 

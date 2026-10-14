@@ -210,6 +210,22 @@ async function checkMetadataTable(details, values, sources) {
       await page.locator('#list-button').click();
       assert.equal(await page.locator('.experiment-link').count(), initial);
     }
+    const gitRun = report.experiments.find(item => item.git?.history?.length && item.git?.recorded_commits?.length);
+    if (gitRun) {
+      await page.locator(`button[data-id="${gitRun.id}"]`).click();
+      const details = page.locator('#experiment-detail > details').filter({has: page.getByText('Git history', {exact: true})});
+      await details.locator('summary').click();
+      assert.deepEqual(await details.locator('th').allTextContents(), ['Commit', 'Message', 'Date']);
+      assert.equal(await details.locator('tbody tr').count(), gitRun.git.history.length);
+      const text = await details.innerText();
+      for (const record of gitRun.git.recorded_commits) assert(text.includes(`${record.artifact}#${record.field}`));
+      assert(text.includes('not the code version used to train a checkpoint'));
+      await page.setViewportSize({ width: 390, height: 844 });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+      await page.setViewportSize({ width: 1440, height: 960 });
+      await page.screenshot({path: process.argv[3].replace(/\.png$/, '-git.png')});
+      await page.locator('#back').click();
+    }
     const unknown = report.experiments.find(item => item.kind !== 'collection' && !report.edges.some(edge => edge.directed && edge.target === item.id));
     if (unknown) {
       await page.locator(`button[data-id="${unknown.id}"]`).click();

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from .models import Artifact, Experiment, stable_id
+from .git_history import text_commits
 
 SECRET = re.compile(r"(^|[._-])(password|secret|api_key|token|access_token|auth_token|credential|credentials|authorization|private_key)([._-]|$)", re.I)
 METRIC = re.compile(r"(^|[._])(loss|accuracy|acc|f1|macro_f1|weighted_f1|mae|mse|rmse|auc|pearson|score|selection_score|best_epoch|epoch|step|epochs)([._]|$)", re.I)
@@ -379,6 +380,8 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
                     prefix = "resume" if "resum" in line.lower() else "checkpoint"
                     fields[f"{prefix}.{len(fields)}"] = match.group(1) or match.group(2)
         artifact.metadata = extract_fields(fields, artifact.path, role=artifact.kind)
+        if suffix in {".log", ".txt"}:
+            artifact.metadata["git_commits"] = text_commits(text)
         # Arbitrarily named JSON can still contain a training configuration.
         leaves = {key.split(".")[-1].lower() for key in fields}
         if artifact.kind == "metadata" and suffix == ".json" and len(leaves & {"lr", "learning_rate", "batch_size", "optimizer", "dropout"}) >= 2:

@@ -7,6 +7,7 @@ from itertools import combinations
 from pathlib import PurePosixPath
 
 from .models import Edge, stable_id
+from .git_history import is_commit_field
 
 
 def edge(source, target, kind, confidence, evidence, *, directed=True, caveats=None, changes=None):
@@ -26,6 +27,8 @@ def comparable_config(experiment, *, include_conflicts=False):
         return result
     for key, value in experiment.config.items():
         lower = key.lower()
+        if is_commit_field(key):
+            continue  # A Git revision is provenance, not a training parameter.
         if any(word in lower for word in ("sha256", "hash", "checkpoint", "references", "source", "output", "device", "gpu", "version", "time", "seed", "samples", "counts", "weights")):
             continue
         if isinstance(value, (str, int, float, bool)) and value != "[REDACTED]" and not str(value).startswith("[omitted"):

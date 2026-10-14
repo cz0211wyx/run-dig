@@ -33,6 +33,11 @@ run-dig compare run-a/best.pt run-b/best.pt --root ./experiments
 `--root` includes related runs; `--full` shows all fields for inspect and compare.
 Scanning is read-only. Checkpoints and scripts are never executed.
 
+With Git installed, scans also show local commit history and verify `git_commit`
+or `git.commit` values recorded in run files. Current HEAD is only scan-time
+context; Git ancestry does not prove checkpoint inheritance. No network access
+is used. Pass `--no-git` to skip Git inspection.
+
 Relationships and checkpoint metrics include evidence and confidence. Similarity
 does not prove ancestry, and confidence is not a calibrated probability. Missing or
 conflicting settings remain unknown; conflicting values keep their sources.
