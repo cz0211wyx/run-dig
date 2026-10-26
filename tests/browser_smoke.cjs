@@ -210,7 +210,8 @@ async function checkMetadataTable(details, values, sources) {
       await page.locator('#list-button').click();
       assert.equal(await page.locator('.experiment-link').count(), initial);
     }
-    const gitRun = report.experiments.find(item => item.git?.history?.length && item.git?.recorded_commits?.length);
+    const gitRuns = report.experiments.filter(item => item.git?.history?.length && item.git?.recorded_commits?.length);
+    const gitRun = gitRuns.find(item => item.git.recorded_commits.some(record => record.line)) || gitRuns[0];
     if (gitRun) {
       await page.locator(`button[data-id="${gitRun.id}"]`).click();
       const details = page.locator('#experiment-detail > details').filter({has: page.getByText('Git history', {exact: true})});
@@ -218,7 +219,7 @@ async function checkMetadataTable(details, values, sources) {
       assert.deepEqual(await details.locator('th').allTextContents(), ['Commit', 'Message', 'Date']);
       assert.equal(await details.locator('tbody tr').count(), gitRun.git.history.length);
       const text = await details.innerText();
-      for (const record of gitRun.git.recorded_commits) assert(text.includes(`${record.artifact}#${record.field}`));
+      for (const record of gitRun.git.recorded_commits) assert(text.includes(`${record.artifact}${record.line ? ':' + record.line : ''}#${record.field}`));
       assert(text.includes('not the code version used to train a checkpoint'));
       await page.setViewportSize({ width: 390, height: 844 });
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);

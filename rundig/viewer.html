@@ -305,7 +305,7 @@ function gitDetails(parent, data) {
   for (const record of records) {
     const revision = String(record.commit || record.value).slice(0, 12);
     parent.append(element('div', `${revision} (${record.resolution})${record.summary ? ' · ' + record.summary : ''}`));
-    parent.append(element('p', `${record.artifact}#${record.field}`, 'path'));
+    parent.append(element('p', `${record.artifact}${record.line ? ':' + record.line : ''}#${record.field}`, 'path'));
   }
   if (data.repository != null) {
     parent.append(element('p', `Repository: ${data.repository} (relative to scan root)`, 'path'));

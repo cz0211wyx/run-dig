@@ -1170,6 +1170,33 @@ class PipelineTests(unittest.TestCase):
     def test_empty_tree(self):
         self.assertEqual(self.report().statistics["experiments"], 0)
 
+    def test_toml_config_and_invalid_toml(self):
+        self.put('run/config.toml', '[train]\nmodel = "tiny"\nlr = 0.001\nbatch_size = 16\n')
+        self.put('run/best.pt', b'weights')
+        report = self.report()
+        self.assertEqual(report.experiments[0].config['train.lr'], .001)
+        self.assertEqual(report.experiments[0].config['train.model'], 'tiny')
+        self.put('run/config.toml', '[invalid')
+        report = self.report()
+        self.assertEqual(report.statistics['checkpoints'], 1)
+        self.assertTrue(any('parse failed' in note['message'] for note in report.warnings))
+
+    def test_progress_does_not_change_results_or_print_from_library(self):
+        self.run_folder('run')
+        events = []
+        with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            report = self.report(git=False, progress=lambda *event: events.append(event))
+        plain = self.report(git=False).to_dict()
+        data = report.to_dict()
+        for item in (data, plain):
+            item.pop('generated_at')
+        self.assertEqual(data, plain)
+        self.assertEqual(stdout.getvalue() + stderr.getvalue(), '')
+        self.assertIn(('Scanning files', report.statistics['visited_files'], report.statistics['visited_files']), events)
+        self.assertIn(('Extracting metadata', len(report.artifacts), len(report.artifacts)), events)
+        self.assertIn(('Identifying experiments',), events)
+        self.assertIn(('Inferring relationships',), events)
+
     def test_cli_end_to_end(self):
         self.run_folder("run")
         output = self.root / "report"
@@ -1177,6 +1204,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((output / "index.html").is_file())
         self.assertIn("Found 1 checkpoints", result.stdout)
+        for stage in ['Scanning files', 'Extracting metadata', 'Identifying experiments', 'Inferring relationships', 'Writing report']:
+            self.assertIn(stage, result.stderr)
+            self.assertNotIn(stage, result.stdout)
 
     def test_renamed_module_runs_outside_checkout_with_default_output(self):
         self.run_folder('run')

@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from rundig.cli import main
 from rundig.git_history import GitReader
+from rundig.metadata import extract
 from rundig.report import write_report
 from rundig.scan import analyze
 
@@ -119,6 +120,7 @@ class GitHistoryTests(unittest.TestCase):
         report = analyze(self.root)
         data = next(item.git for item in report.experiments if item.path == "a")
         self.assertEqual({record["commit"] for record in data["recorded_commits"]}, {first, second})
+        self.assertEqual([record['line'] for record in data['recorded_commits']], [1, 2])
         self.assertTrue(any("Conflicting" in note for note in data["notes"]))
         self.assertTrue(report.edges)
         self.assertFalse(any(fact['signal'] == 'recorded Git versions' for edge in report.edges for fact in edge.evidence))
@@ -230,6 +232,72 @@ class GitHistoryTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]['value'], '123abcde')
         self.assertEqual(records[0]['resolution'], 'unverified')
+
+    def test_structured_logs_preserve_conflicting_commits_and_lines(self):
+        self.put('train.py', 'pass\n')
+        first = self.commit('first')
+        self.put('train.py', 'x = 1\n')
+        second = self.commit('second')
+        self.run_folder('other', second)
+        for suffix, separator in [('jsonl', None), ('csv', ','), ('tsv', '\t')]:
+            self.run_folder(suffix)
+            text = ('\n'.join(json.dumps({'git_commit': value, 'epoch': i}) for i, value in enumerate([first, second]))
+                    if separator is None else f'git_commit{separator}epoch\n{first}{separator}0\n{second}{separator}1\n')
+            self.put(f'{suffix}/history.{suffix}', text)
+        report = analyze(self.root)
+        for suffix in ['jsonl', 'csv', 'tsv']:
+            run = next(item for item in report.experiments if item.path == suffix)
+            records = run.git['recorded_commits']
+            self.assertEqual([r['commit'] for r in records], [first, second])
+            self.assertEqual([r['line'] for r in records], [1, 2] if suffix == 'jsonl' else [2, 3])
+            self.assertTrue(any('Conflicting' in note for note in run.git['notes']))
+            self.assertFalse(any(f['signal'] == 'recorded Git versions' for edge in report.edges
+                                 if run.id in {edge.source, edge.target} for f in edge.evidence))
+        with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(['inspect', 'jsonl/best.pt', '--root', str(self.root)]), 0)
+        self.assertIn('jsonl/history.jsonl:1#git_commit', output.getvalue())
+        self.assertIn('jsonl/history.jsonl:2#git_commit', output.getvalue())
+
+    def test_incomplete_git_log_cannot_supply_relationship_evidence(self):
+        self.put('train.py', 'pass\n')
+        revision = self.commit('model')
+        self.run_folder('run')
+        self.run_folder('other', revision)
+        line = json.dumps({'git_commit': revision}) + '\n'
+        self.put('run/train.jsonl', line + '{invalid json}\n')
+        report = analyze(self.root)
+        run = next(item for item in report.experiments if item.path == 'run')
+        self.assertTrue(any('Incomplete Git records' in note for note in run.git['notes']))
+        self.assertFalse(any(f['signal'] == 'recorded Git versions' for edge in report.edges for f in edge.evidence))
+        self.put('run/train.jsonl', line * 3)
+        artifact = next(item for item in report.artifacts if item.path == 'run/train.jsonl')
+        for limits in ({'record_limit': 1}, {'text_limit': len(line) + 5}):
+            with self.subTest(limits=limits):
+                extract(self.root, artifact, **limits)
+                self.assertFalse(artifact.metadata['git_records_complete'])
+                self.assertEqual(len(artifact.metadata['git_commits']), 1)
+
+    def test_unavailable_commits_still_show_conflicts_but_prefixes_can_agree(self):
+        self.run_folder('run')
+        for revisions, conflict in [(['a' * 40, 'b' * 40], True), (['a' * 12, 'a' * 40], False)]:
+            with self.subTest(revisions=revisions):
+                self.put('run/train.jsonl', '\n'.join(json.dumps({'git_commit': value}) for value in revisions))
+                data = analyze(self.root).experiments[0].git
+                self.assertEqual([r['value'] for r in data['recorded_commits']], revisions)
+                self.assertTrue(all(r['resolution'] == 'unverified' for r in data['recorded_commits']))
+                self.assertEqual(any('Conflicting' in note for note in data['notes']), conflict)
+
+    def test_default_cli_hides_checkout_history_but_full_keeps_it(self):
+        self.run_folder('run')
+        self.commit('history-only-message')
+        for command in (['inspect', 'run/best.pt'], ['compare', 'run/best.pt', 'run/best.pt']):
+            for full in (False, True):
+                with contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
+                    code = main([*command, '--root', str(self.root), *(['--full'] if full else [])])
+                self.assertEqual(code, 0)
+                self.assertIn('Training commit: unknown', output.getvalue())
+                self.assertEqual('history-only-message' in output.getvalue(), full)
+                self.assertEqual('Current checkout:' in output.getvalue(), full)
 
 
 if __name__ == '__main__':

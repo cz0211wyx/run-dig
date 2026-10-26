@@ -20,11 +20,16 @@ def is_commit_field(key):
     return key in COMMIT_KEYS
 
 
+def field_commits(fields, line=None):
+    return [{"field": key, "value": value, **({"line": line} if line is not None else {})}
+            for key, value in fields.items() if is_commit_field(key) and value != "[REDACTED]"]
+
+
 def text_commits(text):
     """Keep repeated log declarations, including conflicting versions."""
     pattern = r"(?<![\w.])(git[_. ]commit(?:_hash)?|git[_. ]sha|git[_. ]hash|git[_. ]revision|commit_hash|commit)\s*[:=]\s*['\"]?([0-9a-f]{7,64})\b"
-    return [{"field": match[1].lower().replace(" ", "_"), "value": match[2].lower()}
-            for match in re.finditer(pattern, text, re.I)]
+    return [{"field": match[1].lower().replace(" ", "_"), "value": match[2].lower(), "line": number}
+            for number, line in enumerate(text.splitlines(), 1) for match in re.finditer(pattern, line, re.I)]
 
 
 class GitReader:
@@ -141,28 +146,29 @@ class GitReader:
         return None
 
 
-def attach_git(root, experiments, artifacts, edges):
+def attach_git(root, experiments, artifacts, edges, *, progress=None):
     """Attach bounded, read-only history and annotate existing graph links only."""
     warnings = []
     reader = GitReader(root, warnings)
     index = {item.id: item for item in artifacts}
     by_id = {item.id: item for item in experiments}
     resolved = {}
-    for experiment in experiments:
+    for number, experiment in enumerate(experiments):
+        if progress:
+            progress("Reading Git history", number, len(experiments))
         if experiment.kind == "collection":
             continue
         members = [index[key] for key in experiment.artifacts]
-        records, seen = [], set()
+        records, seen, incomplete = [], set(), []
         for item in members:
-            if item.kind not in {"config", "metadata", "log"}:
+            if item.kind not in {"config", "metadata", "log", "metrics"}:
                 continue
-            declarations = [{"field": key, "value": value} for key, value in item.metadata.get("fields", {}).items()
-                            if is_commit_field(key) and value != "[REDACTED]"
-                            and Path(item.path).suffix.lower() not in {".log", ".txt"}]
-            declarations.extend(item.metadata.get("git_commits", []))
+            declarations = item.metadata.get("git_commits", field_commits(item.metadata.get("fields", {})))
+            if declarations and item.metadata.get("git_records_complete") is False:
+                incomplete.append(item.path)
             for declaration in declarations:
                 record = {"artifact": item.path, **declaration}
-                key = (item.path, record['field'], str(record['value']))
+                key = (item.path, record.get('line'), record['field'], str(record['value']))
                 if key not in seen:
                     seen.add(key)
                     records.append(record)
@@ -187,11 +193,16 @@ def attach_git(root, experiments, artifacts, edges):
             data["recorded_commits"].append({**record, "resolution": "resolved" if commit else "unverified", **(commit or {})})
         verified = data["recorded_commits"]
         versions = {record["commit"] for record in verified if record["resolution"] == "resolved"}
-        if len(versions) > 1:
+        declared = sorted({str(record.get("commit", record["value"])).lower() for record in verified
+                           if COMMIT_ID.fullmatch(str(record.get("commit", record["value"])))})
+        # A short ID and its full spelling can agree even without local objects.
+        if any(not second.startswith(first) for first, second in zip(declared, declared[1:])):
             data["notes"].append("Conflicting recorded commits; the training code version is unknown.")
         if any(record["resolution"] == "unverified" for record in verified):
             data["notes"].append("Some recorded commits could not be verified in the local repository.")
-        if verified and len(versions) == 1 and all(record["resolution"] == "resolved" for record in verified):
+        if incomplete:
+            data["notes"].append("Incomplete Git records; training code version remains unknown: " + ", ".join(incomplete))
+        if verified and not incomplete and len(versions) == 1 and all(record["resolution"] == "resolved" for record in verified):
             resolved[experiment.id] = (repository, next(iter(versions)))
         if repository and data.get("head"):
             # Query only this run's actual files, never unrelated changes elsewhere
@@ -220,4 +231,6 @@ def attach_git(root, experiments, artifacts, edges):
                                                        for record in by_id[key].git.get('recorded_commits', [])}),
                                   "repository": reader.relative(first[0])})
             edge.caveats.append("Git ancestry describes code history, not checkpoint inheritance; recorded commits may omit uncommitted changes.")
+    if progress:
+        progress("Reading Git history", len(experiments), len(experiments))
     return warnings

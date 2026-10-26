@@ -1,5 +1,7 @@
 name: tests
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   test:
     strategy:
@@ -16,3 +18,27 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python examples/create_demo.py
       - run: run-dig scan demo-experiments -o reports/demo
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: python -m pip install .
+      - run: npm install --no-save --package-lock=false playwright@1.62.1
+      - run: npx playwright install --with-deps chromium --only-shell
+      - run: python examples/create_demo.py
+      - run: run-dig scan demo-experiments -o reports/demo --no-git
+      - run: node tests/browser_smoke.cjs reports/demo/index.html reports/demo/preview.png
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: browser-report
+          path: reports/demo/
+          retention-days: 7

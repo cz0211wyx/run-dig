@@ -83,7 +83,7 @@ def npz_checkpoint(path):
 
 
 def inventory(root: Path, *, excludes=(), output: Path | None = None, text_limit=2_000_000,
-              hash_limit=64_000_000, hash_budget=512_000_000, max_files=100_000):
+              hash_limit=64_000_000, hash_budget=512_000_000, max_files=100_000, progress=None):
     artifacts, warnings = [], []
     stats = {"visited_files": 0, "skipped_directories": 0, "skipped_symlinks": 0,
              "hashed_checkpoint_bytes": 0, "unhashed_checkpoints": 0}
@@ -113,6 +113,8 @@ def inventory(root: Path, *, excludes=(), output: Path | None = None, text_limit
         directories[:] = kept
         for name in sorted(filenames):
             stats["visited_files"] += 1
+            if progress:
+                progress("Scanning files", stats["visited_files"])
             if stats["visited_files"] > max_files:
                 warnings.append({"path": ".", "message": f"File limit ({max_files}) reached; scan incomplete.", "kind": "limit"})
                 return artifacts, warnings, stats
@@ -169,27 +171,39 @@ ASSUMPTIONS = [
 
 def analyze(root, *, output=None, excludes=(), text_limit=2_000_000, hash_limit=64_000_000,
             hash_budget=512_000_000, max_files=100_000, similarity_threshold=.6,
-            max_pairs=200_000, git=True):
+            max_pairs=200_000, git=True, progress=None):
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"Not a readable directory: {root}")
     output = Path(output).resolve() if output else None
     if output == root:
         raise ValueError("Report output must not be the scan root itself.")
+    if progress:
+        progress("Scanning files", 0)
     artifacts, warnings, statistics = inventory(root, excludes=excludes, output=output, text_limit=text_limit,
-                                                hash_limit=hash_limit, hash_budget=hash_budget, max_files=max_files)
-    for item in artifacts:
+                                                hash_limit=hash_limit, hash_budget=hash_budget, max_files=max_files,
+                                                progress=progress)
+    if progress:
+        progress("Scanning files", statistics["visited_files"], statistics["visited_files"])
+        progress("Extracting metadata", 0, len(artifacts))
+    for number, item in enumerate(artifacts, 1):
         extract(root, item, text_limit)
         warnings.extend({"kind": "extraction", "path": item.path, "message": warning} for warning in item.warnings)
+        if progress:
+            progress("Extracting metadata", number, len(artifacts))
+    if progress:
+        progress("Identifying experiments")
     experiments, ownership = identify(artifacts)
     for experiment in experiments:
         if experiment.path == ".":
             experiment.name = root.name
+    if progress:
+        progress("Inferring relationships")
     edges, inference_warnings = infer(experiments, artifacts, ownership, similarity_threshold=similarity_threshold,
                                        max_pairs=max_pairs)
     warnings.extend(inference_warnings)
     if git:
-        warnings.extend(attach_git(root, experiments, artifacts, edges))
+        warnings.extend(attach_git(root, experiments, artifacts, edges, progress=progress))
     statistics.update({
         "artifacts": len(artifacts), "artifact_kinds": dict(Counter(item.kind for item in artifacts)),
         "experiments": len(experiments), "anchored_experiments": sum(item.kind == "experiment" for item in experiments),

@@ -1,6 +1,6 @@
 # run-dig
 
-Scan messy ML folders to find checkpoints, recover experiment metadata, and trace possible relationships.
+Recover ML experiment metadata and infer lineage from existing files. No prior tracking setup required.
 
 Requires Python 3.10+.
 
@@ -30,7 +30,7 @@ run-dig inspect run-a/best.pt --root ./experiments
 run-dig compare run-a/best.pt run-b/best.pt --root ./experiments
 ```
 
-`--root` includes related runs; `--full` shows all fields for inspect and compare.
+`--root` includes related runs; `--full` shows all fields and Git history for inspect and compare.
 Scanning is read-only. Checkpoints and scripts are never executed.
 
 With Git installed, scans also show local commit history and verify `git_commit`

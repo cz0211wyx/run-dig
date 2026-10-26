@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 from . import __version__
 from .scan import CHECKPOINT_EXTENSIONS, analyze, is_link, npz_checkpoint
 from .metadata import ARTIFACT_FOLDERS
+from .git_history import is_commit_field
 from .report import validate_output, write_report
 
 
@@ -83,6 +85,23 @@ def list_checkpoints(args):
     return 1 if errors else 0
 
 
+def progress_printer():
+    """Keep progress on stderr, with bounded updates for large folders."""
+    previous, last_update = None, 0
+
+    def update(stage, current=None, total=None):
+        nonlocal previous, last_update
+        now = time.monotonic()
+        finished = total is not None and current == total
+        if stage != previous or finished or now - last_update >= 2:
+            count = f": {current:,}" if current is not None else ""
+            if total is not None:
+                count += f"/{total:,}"
+            print(f"{stage}{count} ...", file=sys.stderr, flush=True)
+            previous, last_update = stage, now
+    return update
+
+
 def load_checkpoints(paths, root=None, *, git=True):
     root = root.expanduser().resolve() if root else None
     checkpoints = []
@@ -100,7 +119,7 @@ def load_checkpoints(paths, root=None, *, git=True):
     if any(not checkpoint.is_relative_to(root) for checkpoint in checkpoints):
         raise ValueError("Checkpoints must be inside --root.")
     print(f"Scanning {root} ...", flush=True)
-    report = analyze(root, git=git)
+    report = analyze(root, git=git, progress=progress_printer())
     artifacts = {item.path: item for item in report.artifacts if item.kind == "checkpoint"}
     owners = {key: item for item in report.experiments for key in item.artifacts}
     result = []
@@ -132,18 +151,27 @@ def print_checkpoint_metrics(artifact, full=False):
             print(f"    ... {len(keys) - 8} more fields; use --full to show all.")
 
 
-def print_git(experiment):
+def print_git(experiment, full=False):
     data = experiment.git
     if not data:
         return
     print("\nGit:")
-    for record in data.get("recorded_commits", []):
+    records = data.get("recorded_commits", [])
+    for record in records if full else records[:3]:
         revision = record.get("commit", str(record["value"]))[:12]
-        print(f"  Recorded: {revision} ({record['resolution']}) | {record['artifact']}#{record['field']}")
+        source = record['artifact'] + (f":{record['line']}" if 'line' in record else '')
+        print(f"  Recorded: {revision} ({record['resolution']}) | {source}#{record['field']}")
         if record.get("summary"):
             print(f"    {record['summary']}")
-    if not data.get("recorded_commits"):
+    if not records:
         print("  Training commit: unknown (not recorded).")
+    if not full:
+        for note in data.get("notes", []):
+            if not note.startswith("Current checkout"):
+                print(f"  Note: {note}")
+        if len(records) > 3 or data.get('head'):
+            print("  Use --full for all Git records and checkout history.")
+        return
     if data.get("repository") is not None:
         print(f"  Repository: {data['repository']} (relative to scan root)")
         head = data.get("head")
@@ -200,14 +228,15 @@ def inspect_checkpoint(args):
     for reference in experiment.references:
         if reference.get("resolution") in {"unresolved", "ambiguous"}:
             print(f"  {reference['resolution'].capitalize()} source: {reference['value']}")
-    print_git(experiment)
     print_checkpoint_metrics(artifact, args.full)
+    print_git(experiment, args.full)
     # Run summaries remain useful context, but must not be mistaken for this file.
     for heading, values in (("Run configuration", experiment.config), ("Run metrics", experiment.metrics)):
         print(f"\n{heading}:")
         if heading == "Run metrics":
             print("  Run summaries / last parsed log values; not necessarily this checkpoint.")
-        visible = {key: value for key, value in values.items() if not any(word in key.lower() for word in ("sha256", "hash"))}
+        visible = {key: value for key, value in values.items() if not any(word in key.lower() for word in ("sha256", "hash"))
+                   and (args.full or not is_commit_field(key))}
         if not visible:
             print("  Not found.")
         core = {"model", "model_type", "architecture", "seed", "lr", "learning_rate", "batch_size", "epochs"}
@@ -232,7 +261,7 @@ def compare_checkpoints(args):
     for label, (path, artifact, experiment) in zip("AB", entries):
         print(f"{label}: {path} ({format_size(artifact.size)})")
         print(f"   Experiment: {experiment.path}")
-        print_git(experiment)
+        print_git(experiment, args.full)
     left, right = entries[0][2], entries[1][2]
     print("\nRun relationship:")
     relations = [edge for edge in report.edges if {edge.source, edge.target} == {left.id, right.id}]
@@ -255,6 +284,8 @@ def compare_checkpoints(args):
         result = {}
         for key, value in experiment.config.items():
             if value == "[REDACTED]" or any(word in key.lower() for word in ("sha256", "hash")):
+                continue
+            if not args.full and is_commit_field(key):
                 continue
             alternatives = experiment.config_sources.get(key, [])
             if any(source["value"] != value for source in alternatives):
@@ -306,7 +337,7 @@ def compare_checkpoints(args):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="run-dig", description="Find experiments and trace their relationships.")
+    parser = argparse.ArgumentParser(prog="run-dig", description="Recover ML experiment metadata and infer lineage from existing files.")
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     scan = commands.add_parser("scan", help="Analyze a folder and create a browser report")
@@ -321,12 +352,12 @@ def main(argv=None):
     inspect = commands.add_parser("inspect", help="Print checkpoint information, metadata, and sources")
     inspect.add_argument("checkpoint", type=Path, help="Checkpoint file; relative to --root when provided")
     inspect.add_argument("--root", type=Path, help="Scan this directory for related experiments (default: checkpoint's folder)")
-    inspect.add_argument("--full", action="store_true", help="Show all configuration and metric fields")
+    inspect.add_argument("--full", action="store_true", help="Show all recovered fields and Git history")
     compare = commands.add_parser("compare", help="Compare two checkpoints' recovered configuration and metrics")
     compare.add_argument("first", type=Path)
     compare.add_argument("second", type=Path)
     compare.add_argument("--root", type=Path, help="Scan directory; checkpoint paths are relative to it (default: common parent)")
-    compare.add_argument("--full", action="store_true", help="Show every field and longer values")
+    compare.add_argument("--full", action="store_true", help="Show every field, longer values, and Git history")
     for command in (scan, inspect, compare):
         command.add_argument("--no-git", action="store_true", help="Skip local Git history")
     args = parser.parse_args(argv)
@@ -345,7 +376,9 @@ def main(argv=None):
     try:
         validate_output(output)
         print(f"Scanning {root} ...", flush=True)
-        report = analyze(root, output=output, excludes=args.exclude, git=not args.no_git)
+        progress = progress_printer()
+        report = analyze(root, output=output, excludes=args.exclude, git=not args.no_git, progress=progress)
+        progress("Writing report")
         html = write_report(report, output)
     except (OSError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)

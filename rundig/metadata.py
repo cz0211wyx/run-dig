@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from .models import Artifact, Experiment, stable_id
-from .git_history import text_commits
+from .git_history import field_commits, is_commit_field, text_commits
 
 SECRET = re.compile(r"(^|[._-])(password|secret|api_key|token|access_token|auth_token|credential|credentials|authorization|private_key)([._-]|$)", re.I)
 METRIC = re.compile(r"(^|[._])(loss|accuracy|acc|f1|macro_f1|weighted_f1|mae|mse|rmse|auc|pearson|score|selection_score|best_epoch|epoch|step|epochs)([._]|$)", re.I)
@@ -288,7 +288,8 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
         except UnicodeDecodeError:
             text = raw.decode("utf-8-sig", errors="replace")
             artifact.warnings.append("Non-UTF-8 bytes replaced while reading text.")
-        fields, records, metric_rows = {}, 0, []
+        fields, records, metric_rows, git_commits = {}, 0, [], []
+        git_complete = not truncated
 
         def remember(value, location, depth=0, record=True):
             # Retain individual rows until checkpoint attribution; never merge epochs.
@@ -330,8 +331,7 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
             try:
                 import tomllib
             except ImportError:
-                artifact.warnings.append("TOML metadata extraction requires Python 3.11+.")
-                return
+                import tomli as tomllib
             fields = flatten(tomllib.loads(text))
         elif suffix in {".ini", ".cfg"}:
             parser = configparser.ConfigParser(interpolation=None)
@@ -345,18 +345,27 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
                         continue
                     try:
                         value = json.loads(line)
-                        fields.update(flatten(value))
+                        row_fields = flatten(value)
+                        git_commits.extend(field_commits(row_fields, number))
+                        fields.update(row_fields)
                         remember(value, f"{artifact.path}:{number}")
                         records += 1
                     except (ValueError, RecursionError):
                         artifact.warnings.append("Malformed JSONL record skipped.")
+                        git_complete = False
+                if len(rows) > record_limit:
+                    git_complete = False
             else:
                 reader = csv.DictReader(io.StringIO(text), delimiter="\t" if suffix == ".tsv" else ",")
                 for row in reader:
                     if records >= record_limit:
+                        git_complete = False
                         break
                     fields = {str(k): scalar(v) for k, v in row.items() if k is not None}
+                    git_commits.extend(field_commits(flatten(fields), reader.line_num))
                     for key, value in list(fields.items()):
+                        if is_commit_field(key):
+                            continue
                         try:
                             fields[key] = scalar(float(value))
                         except (ValueError, TypeError):
@@ -381,7 +390,13 @@ def extract(root: Path, artifact: Artifact, text_limit=2_000_000, record_limit=2
                     fields[f"{prefix}.{len(fields)}"] = match.group(1) or match.group(2)
         artifact.metadata = extract_fields(fields, artifact.path, role=artifact.kind)
         if suffix in {".log", ".txt"}:
-            artifact.metadata["git_commits"] = text_commits(text)
+            lines = text.splitlines()
+            git_commits = text_commits("\n".join(lines[:record_limit]))
+            git_complete = git_complete and len(lines) <= record_limit
+        elif suffix not in {".jsonl", ".csv", ".tsv"}:
+            git_commits = field_commits(fields)
+        artifact.metadata["git_commits"] = git_commits
+        artifact.metadata["git_records_complete"] = git_complete
         # Arbitrarily named JSON can still contain a training configuration.
         leaves = {key.split(".")[-1].lower() for key in fields}
         if artifact.kind == "metadata" and suffix == ".json" and len(leaves & {"lr", "learning_rate", "batch_size", "optimizer", "dropout"}) >= 2:
